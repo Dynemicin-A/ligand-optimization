@@ -1,0 +1,23 @@
+model:
+  name: complex_denoiser_backbone
+  num_ligand_atom_types: 16
+  num_protein_atom_types: 32
+  num_bond_types: 5
+  hidden_dim: 96
+  time_dim: 32
+  rbf_dim: 16
+  num_blocks: 3
+  ligand_knn: 8
+  protein_knn: 12
+  cross_knn: 16
+  source_knn: 8
+  cutoff: 12.0
+
+diffusion:
+  num_timesteps: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+  atom_mask_token: 15
+  pos_loss_weight: 1.0
+  atom_loss_weight: 1.0
+  bond_loss_weight: 0.2
