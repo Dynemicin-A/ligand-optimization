@@ -57,7 +57,11 @@ This mirrors the common pattern in TargetDiff/DiffSBDD-style diffusion models: e
 
 - [scripts/train_diffusion.py](</Users/z/Desktop/ligand- optimization/scripts/train_diffusion.py>)
 - [scripts/sample_diffusion.py](</Users/z/Desktop/ligand- optimization/scripts/sample_diffusion.py>)
+- [scripts/preprocess_h2l.py](</Users/z/Desktop/ligand- optimization/scripts/preprocess_h2l.py>)
+- [scripts/evaluate_molecules.py](</Users/z/Desktop/ligand- optimization/scripts/evaluate_molecules.py>)
 - [src/pco_backbone/data.py](</Users/z/Desktop/ligand- optimization/src/pco_backbone/data.py>)
+- [src/pco_backbone/chem.py](</Users/z/Desktop/ligand- optimization/src/pco_backbone/chem.py>)
+- [src/pco_backbone/metrics.py](</Users/z/Desktop/ligand- optimization/src/pco_backbone/metrics.py>)
 - [src/pco_backbone/model.py](</Users/z/Desktop/ligand- optimization/src/pco_backbone/model.py>)
 - [src/pco_backbone/layers.py](</Users/z/Desktop/ligand- optimization/src/pco_backbone/layers.py>)
 - [src/pco_backbone/diffusion.py](</Users/z/Desktop/ligand- optimization/src/pco_backbone/diffusion.py>)

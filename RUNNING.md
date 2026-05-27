@@ -59,3 +59,28 @@ Optional bond labels:
 
 - `ligand_bond_edge_index`
 - `ligand_bond_type`
+
+## Preprocess Real H2L Triples
+
+```bash
+python3 scripts/preprocess_h2l.py \
+  --csv data/h2l/train.csv \
+  --outdir data/processed_h2l/train \
+  --pocket-radius 10
+```
+
+The CSV must contain:
+
+- `protein_path`
+- `source_ligand_path`
+- `target_ligand_path`
+
+## Evaluate Molecules
+
+```bash
+python3 scripts/evaluate_molecules.py \
+  --generated-sdf outputs/diffusion_tiny/sample.sdf \
+  --reference-smiles data/h2l/reference_actives.smi \
+  --source-smiles data/h2l/source_hits.smi \
+  --out outputs/diffusion_tiny/eval_metrics.json
+```

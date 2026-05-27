@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from pco_backbone import BackboneConfig, ComplexDenoiserBackbone, DiffusionConfig, ProteinConditionedDiffusion  # noqa: E402
+from pco_backbone.chem import tensors_to_mol, write_mol_sdf  # noqa: E402
 from pco_backbone.data import SyntheticH2LConfig, SyntheticH2LDataset, move_batch_to_device  # noqa: E402
 
 
@@ -18,6 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sample from a trained diffusion checkpoint.")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--out", type=Path, default=ROOT / "outputs/sample.pt")
+    parser.add_argument("--sdf-out", type=Path, default=None)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--num-steps", type=int, default=32)
     parser.add_argument("--num-ligand-atoms", type=int, default=12)
@@ -76,6 +78,18 @@ def main() -> None:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     torch.save({key: value.detach().cpu() for key, value in sample.items()}, args.out)
     print(f"saved sample: {args.out}")
+    if args.sdf_out is not None:
+        mol = tensors_to_mol(
+            sample["ligand_atom_type"],
+            sample["ligand_pos"],
+            sample["bond_edge_index"],
+            sample["bond_type"],
+            sanitize=False,
+        )
+        if mol is None:
+            raise RuntimeError("failed to convert sample tensors to RDKit molecule")
+        write_mol_sdf(mol, args.sdf_out)
+        print(f"saved sdf: {args.sdf_out}")
 
 
 if __name__ == "__main__":
