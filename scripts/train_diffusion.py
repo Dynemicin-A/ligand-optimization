@@ -3,15 +3,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
+import signal
 import sys
 from dataclasses import asdict
 from pathlib import Path
 from time import time
 
 import torch
+import torch.distributed as dist
 import yaml
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, random_split
+from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,13 +60,40 @@ def seed_all(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def resolve_device(device_arg: str) -> torch.device:
+def setup_distributed() -> tuple[bool, int, int, int]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    distributed = world_size > 1
+    if distributed and not dist.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend)
+    return distributed, rank, local_rank, world_size
+
+
+def is_main_process(rank: int) -> bool:
+    return rank == 0
+
+
+def unwrap_model(model: torch.nn.Module) -> ProteinConditionedDiffusion:
+    if isinstance(model, DistributedDataParallel):
+        return model.module
+    return model
+
+
+def resolve_device(device_arg: str, local_rank: int = 0, distributed: bool = False) -> torch.device:
     if device_arg == "auto":
         if torch.cuda.is_available():
+            if distributed:
+                torch.cuda.set_device(local_rank)
+                return torch.device("cuda", local_rank)
             return torch.device("cuda")
         if torch.backends.mps.is_available():
             return torch.device("mps")
         return torch.device("cpu")
+    if device_arg == "cuda" and distributed:
+        torch.cuda.set_device(local_rank)
+        return torch.device("cuda", local_rank)
     return torch.device(device_arg)
 
 
@@ -103,15 +135,23 @@ def split_dataset(dataset, valid_fraction: float, seed: int):
     return random_split(dataset, [n_train, n_valid], generator=generator)
 
 
-def make_loader(dataset, train_cfg: dict, shuffle: bool, num_workers_override: int | None):
+def make_loader(
+    dataset,
+    train_cfg: dict,
+    shuffle: bool,
+    num_workers_override: int | None,
+    sampler=None,
+):
     num_workers = train_cfg.get("num_workers", 0) if num_workers_override is None else num_workers_override
     return DataLoader(
         dataset,
         batch_size=train_cfg.get("batch_size", 4),
-        shuffle=shuffle,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
         num_workers=num_workers,
         collate_fn=collate_complex_records,
         pin_memory=train_cfg.get("pin_memory", False),
+        drop_last=train_cfg.get("drop_last", False),
     )
 
 
@@ -134,22 +174,23 @@ def evaluate(model, loader, device: torch.device, max_batches: int) -> dict[str,
 
 def save_checkpoint(
     path: Path,
-    model: ProteinConditionedDiffusion,
+    model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     step: int,
     epoch: int,
     cfg: dict,
 ) -> None:
+    raw_model = unwrap_model(model)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "step": step,
             "epoch": epoch,
-            "model_state": model.state_dict(),
+            "model_state": raw_model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "config": cfg,
-            "backbone_config": asdict(model.backbone.config),
-            "diffusion_config": asdict(model.config),
+            "backbone_config": asdict(raw_model.backbone.config),
+            "diffusion_config": asdict(raw_model.config),
         },
         path,
     )
@@ -166,17 +207,47 @@ def main() -> None:
     args = parse_args()
     cfg = load_yaml(args.config)
     train_cfg = cfg.get("train", {})
+    distributed, rank, local_rank, world_size = setup_distributed()
+    main_process = is_main_process(rank)
+    stop_requested = {"value": False}
+
+    def request_stop(signum, _frame) -> None:
+        stop_requested["value"] = True
+        if main_process:
+            print(f"received signal {signum}; saving checkpoint after current step", flush=True)
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
     seed_all(cfg.get("seed", 2024))
 
-    device = resolve_device(args.device)
+    device = resolve_device(args.device, local_rank=local_rank, distributed=distributed)
     args.outdir.mkdir(parents=True, exist_ok=True)
-    (args.outdir / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+    if main_process:
+        (args.outdir / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+    if distributed:
+        dist.barrier()
 
     dataset = build_dataset(cfg)
     train_set, valid_set = split_dataset(dataset, train_cfg.get("valid_fraction", 0.1), cfg.get("seed", 2024))
-    train_loader = make_loader(train_set, train_cfg, shuffle=True, num_workers_override=args.num_workers)
+    train_sampler = None
+    if distributed:
+        train_sampler = DistributedSampler(
+            train_set,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=cfg.get("seed", 2024),
+            drop_last=train_cfg.get("drop_last", False),
+        )
+    train_loader = make_loader(
+        train_set,
+        train_cfg,
+        shuffle=True,
+        num_workers_override=args.num_workers,
+        sampler=train_sampler,
+    )
     valid_loader = None
-    if valid_set is not None:
+    if valid_set is not None and main_process:
         valid_loader = make_loader(valid_set, train_cfg, shuffle=False, num_workers_override=args.num_workers)
 
     model = build_model(cfg).to(device)
@@ -190,6 +261,13 @@ def main() -> None:
     start_epoch = 0
     if args.resume is not None:
         step, start_epoch = load_checkpoint(args.resume, model, optimizer)
+    if distributed:
+        model = DistributedDataParallel(
+            model,
+            device_ids=[local_rank] if device.type == "cuda" else None,
+            output_device=local_rank if device.type == "cuda" else None,
+            find_unused_parameters=True,
+        )
 
     max_steps = args.max_steps or train_cfg.get("max_steps", 1000)
     grad_clip = train_cfg.get("grad_clip", 1.0)
@@ -200,13 +278,23 @@ def main() -> None:
 
     metrics_path = args.outdir / "metrics.jsonl"
     start_time = time()
-    pbar = tqdm(total=max_steps, initial=step, desc="training", dynamic_ncols=True)
+    pbar = tqdm(
+        total=max_steps,
+        initial=step,
+        desc="training",
+        dynamic_ncols=True,
+        disable=not main_process,
+    )
     epoch = start_epoch
-    while step < max_steps:
+    while step < max_steps and not stop_requested["value"]:
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         model.train()
         for batch in train_loader:
+            if stop_requested["value"]:
+                break
             batch = move_batch_to_device(batch, device)
-            out = model.training_loss(batch)
+            out = model(batch)
             loss = out["loss"]
 
             optimizer.zero_grad(set_to_none=True)
@@ -218,7 +306,7 @@ def main() -> None:
             step += 1
             pbar.update(1)
 
-            if step % log_every == 0 or step == 1:
+            if main_process and (step % log_every == 0 or step == 1):
                 log = {
                     "step": step,
                     "epoch": epoch,
@@ -234,21 +322,30 @@ def main() -> None:
                     f.write(json.dumps(log) + "\n")
 
             if valid_loader is not None and step % valid_every == 0:
-                valid_metrics = evaluate(model, valid_loader, device, valid_batches)
-                log = {"step": step, **{f"valid_{k}": v for k, v in valid_metrics.items()}}
-                with metrics_path.open("a") as f:
-                    f.write(json.dumps(log) + "\n")
+                valid_metrics = evaluate(unwrap_model(model), valid_loader, device, valid_batches)
+                if main_process:
+                    log = {"step": step, **{f"valid_{k}": v for k, v in valid_metrics.items()}}
+                    with metrics_path.open("a") as f:
+                        f.write(json.dumps(log) + "\n")
+            if distributed and step % valid_every == 0:
+                dist.barrier()
 
-            if step % save_every == 0:
+            if main_process and step % save_every == 0:
                 save_checkpoint(args.outdir / f"checkpoint_step_{step}.pt", model, optimizer, step, epoch, cfg)
+            if distributed and step % save_every == 0:
+                dist.barrier()
 
-            if step >= max_steps:
+            if step >= max_steps or stop_requested["value"]:
                 break
         epoch += 1
 
     pbar.close()
-    save_checkpoint(args.outdir / "checkpoint_last.pt", model, optimizer, step, epoch, cfg)
-    print(f"done: step={step}, checkpoint={args.outdir / 'checkpoint_last.pt'}")
+    if main_process:
+        save_checkpoint(args.outdir / "checkpoint_last.pt", model, optimizer, step, epoch, cfg)
+        print(f"done: step={step}, checkpoint={args.outdir / 'checkpoint_last.pt'}")
+    if distributed:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

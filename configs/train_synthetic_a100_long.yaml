@@ -1,0 +1,47 @@
+seed: 2024
+
+model:
+  num_ligand_atom_types: 16
+  num_protein_atom_types: 32
+  num_bond_types: 5
+  hidden_dim: 256
+  time_dim: 128
+  rbf_dim: 48
+  num_blocks: 8
+  ligand_knn: 24
+  protein_knn: 32
+  cross_knn: 48
+  source_knn: 24
+  cutoff: 12.0
+
+diffusion:
+  num_timesteps: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+  atom_mask_token: 15
+  pos_loss_weight: 1.0
+  atom_loss_weight: 1.0
+  bond_loss_weight: 0.2
+
+data:
+  kind: synthetic
+  num_samples: 200000
+  min_protein_atoms: 96
+  max_protein_atoms: 192
+  min_ligand_atoms: 12
+  max_ligand_atoms: 36
+
+train:
+  batch_size: 12
+  num_workers: 8
+  pin_memory: true
+  drop_last: true
+  valid_fraction: 0.02
+  max_steps: 1000000
+  lr: 0.0001
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  log_every: 100
+  valid_every: 2500
+  valid_batches: 64
+  save_every: 10000
