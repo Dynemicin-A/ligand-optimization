@@ -21,19 +21,34 @@ cd "$DATA_DIR"
 echo "data_dir=$DATA_DIR"
 echo "url=$URL"
 
-curl -L -C - \
-  --retry 20 \
-  --retry-delay 30 \
-  --connect-timeout 30 \
-  -o MolGenBench_Version3.zip \
-  "$URL"
-
-echo "${EXPECTED_MD5}  MolGenBench_Version3.zip" | md5sum -c -
+if [ -f MolGenBench_Version3.zip ] && echo "${EXPECTED_MD5}  MolGenBench_Version3.zip" | md5sum -c -; then
+  echo "existing archive passed md5; skip download"
+else
+  curl -L -C - \
+    --retry 20 \
+    --retry-delay 30 \
+    --connect-timeout 30 \
+    -o MolGenBench_Version3.zip \
+    "$URL"
+  echo "${EXPECTED_MD5}  MolGenBench_Version3.zip" | md5sum -c -
+fi
 sha256sum MolGenBench_Version3.zip > MolGenBench_Version3.zip.sha256
 
 rm -rf extracted
 mkdir -p extracted
-unzip -q -o MolGenBench_Version3.zip -d extracted
+if command -v unzip >/dev/null 2>&1; then
+  unzip -q -o MolGenBench_Version3.zip -d extracted
+else
+  python - <<'PY'
+from pathlib import Path
+from zipfile import ZipFile
+
+archive = Path("MolGenBench_Version3.zip")
+outdir = Path("extracted")
+with ZipFile(archive) as zf:
+    zf.extractall(outdir)
+PY
+fi
 
 find extracted -maxdepth 5 -type f | sort > extracted_filelist.txt
 du -h -d 3 . > size_report.txt
