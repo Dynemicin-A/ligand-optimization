@@ -16,6 +16,10 @@ REPO_DIR="/home/scc/pb22000262/ligand-optimization"
 CONFIG="${CONFIG:-configs/train_h2l_a100_1gpu_4h.yaml}"
 RUN_NAME="${RUN_NAME:-h2l_a100_1gpu_4h_${SLURM_JOB_ID}}"
 OUTDIR="${OUTDIR:-outputs/${RUN_NAME}}"
+RESUME_ARG=()
+if [ "${RESUME:-}" != "" ]; then
+  RESUME_ARG=(--resume "$RESUME")
+fi
 
 cd "$REPO_DIR"
 mkdir -p logs outputs
@@ -38,4 +42,5 @@ python scripts/train_diffusion.py \
   --config "$CONFIG" \
   --outdir "$OUTDIR" \
   --device cuda \
-  --num-workers "${NUM_WORKERS:-2}"
+  --num-workers "${NUM_WORKERS:-0}" \
+  "${RESUME_ARG[@]}"

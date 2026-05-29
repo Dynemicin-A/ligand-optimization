@@ -40,4 +40,4 @@ train:
   log_every: 50
   valid_every: 1500
   valid_batches: 32
-  save_every: 1500
+  save_every: 500

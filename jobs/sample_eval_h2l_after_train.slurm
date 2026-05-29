@@ -18,6 +18,7 @@ MANIFEST="${MANIFEST:-data/processed_h2l/train/manifest.txt}"
 SAMPLE_DIR="${SAMPLE_DIR:-${RUN_DIR}/generated_sdf}"
 NUM_SAMPLES="${NUM_SAMPLES:-256}"
 NUM_STEPS="${NUM_STEPS:-64}"
+EVAL_OUT="${EVAL_OUT:-${RUN_DIR}/eval_metrics.json}"
 
 cd "$REPO_DIR"
 mkdir -p logs "$SAMPLE_DIR"
@@ -42,4 +43,4 @@ python scripts/evaluate_molecules.py \
   --generated-sdf "$SAMPLE_DIR/sdf" \
   --reference-smiles "$SAMPLE_DIR/reference.smi" \
   --source-smiles "$SAMPLE_DIR/source.smi" \
-  --out "$RUN_DIR/eval_metrics.json"
+  --out "$EVAL_OUT"
