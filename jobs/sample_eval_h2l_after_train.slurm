@@ -27,9 +27,23 @@ source /home/scc/pb22000262/miniconda3/etc/profile.d/conda.sh
 conda activate dataset-agent
 
 if [ ! -s "$CHECKPOINT" ]; then
+  if [ "$CHECKPOINT" = "latest" ] || [ "$CHECKPOINT" = "auto" ]; then
+    if [ -s "$RUN_DIR/checkpoint_last.pt" ]; then
+      CHECKPOINT="$RUN_DIR/checkpoint_last.pt"
+    else
+      CHECKPOINT="$(ls -1t "$RUN_DIR"/checkpoint_step_*.pt 2>/dev/null | head -n 1 || true)"
+    fi
+  fi
+fi
+
+if [ ! -s "$CHECKPOINT" ]; then
   echo "Missing checkpoint: $CHECKPOINT" >&2
   exit 66
 fi
+
+echo "checkpoint: $CHECKPOINT"
+echo "sample_dir: $SAMPLE_DIR"
+echo "eval_out: $EVAL_OUT"
 
 python scripts/sample_h2l_manifest.py \
   --checkpoint "$CHECKPOINT" \
