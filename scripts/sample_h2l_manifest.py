@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
 from pathlib import Path
 
@@ -58,12 +59,15 @@ def read_manifest(path: Path) -> list[Path]:
 
 
 def first_mol_smiles(path: str | Path, index: int = 0) -> str:
-    supplier = Chem.SDMolSupplier(str(path), sanitize=True, removeHs=False)
-    mol = None
-    for i, candidate in enumerate(supplier):
-        if i == index:
-            mol = candidate
-            break
+    try:
+        supplier = Chem.SDMolSupplier(str(path), sanitize=True, removeHs=False)
+        mol = None
+        for i, candidate in enumerate(supplier):
+            if i == index:
+                mol = candidate
+                break
+    except Exception:
+        return ""
     if mol is None:
         return ""
     return Chem.MolToSmiles(Chem.RemoveHs(mol), canonical=True, isomericSmiles=True)
@@ -101,6 +105,7 @@ def main() -> None:
     reference_smiles: list[str] = []
     source_smiles: list[str] = []
     generated_sdfs: list[str] = []
+    failures: list[dict[str, str]] = []
 
     for i, record_path in enumerate(tqdm(selected, desc="sample-h2l")):
         raw = torch.load(record_path, map_location="cpu", weights_only=False)
@@ -124,8 +129,29 @@ def main() -> None:
         sdf_path = sdf_dir / f"{record_id}.sdf"
         if mol is not None:
             mol.SetProp("_Name", record_id)
-            write_mol_sdf(mol, sdf_path)
-            generated_sdfs.append(str(sdf_path.resolve()))
+            try:
+                write_mol_sdf(mol, sdf_path)
+                generated_sdfs.append(str(sdf_path.resolve()))
+            except Exception as exc:
+                failures.append(
+                    {
+                        "record_id": record_id,
+                        "record_path": str(record_path),
+                        "stage": "write_sdf",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                if sdf_path.exists():
+                    sdf_path.unlink()
+        else:
+            failures.append(
+                {
+                    "record_id": record_id,
+                    "record_path": str(record_path),
+                    "stage": "tensors_to_mol",
+                    "error": "tensors_to_mol returned None",
+                }
+            )
         generated_smiles.append(mol_smiles_or_empty(mol))
         reference_smiles.append(first_mol_smiles(raw["target_ligand_path"], int(raw.get("target_index", 0))))
         source_smiles.append(first_mol_smiles(raw["source_ligand_path"], 0))
@@ -134,8 +160,13 @@ def main() -> None:
     (args.outdir / "generated.smi").write_text("\n".join(generated_smiles) + "\n")
     (args.outdir / "reference.smi").write_text("\n".join(reference_smiles) + "\n")
     (args.outdir / "source.smi").write_text("\n".join(source_smiles) + "\n")
+    with (args.outdir / "failures.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["record_id", "record_path", "stage", "error"])
+        writer.writeheader()
+        writer.writerows(failures)
     print(f"sampled_records: {len(selected)}")
     print(f"written_sdf: {len(generated_sdfs)}")
+    print(f"failed_records: {len(failures)}")
     print(f"sdf_dir: {sdf_dir}")
 
 

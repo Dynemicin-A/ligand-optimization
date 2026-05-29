@@ -53,3 +53,8 @@ def test_metrics():
     assert metrics.n_valid == 3
     assert metrics.reference_rediscovery_rate is not None
     assert metrics.reference_hit_rate is not None
+
+    metrics_with_failure = compute_molecule_metrics(generated + [None], reference_mols=refs, source_mols=sources)
+    assert metrics_with_failure.n_total == 4
+    assert metrics_with_failure.n_valid == 3
+    assert metrics_with_failure.validity == 0.75

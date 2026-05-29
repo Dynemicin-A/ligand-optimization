@@ -27,6 +27,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-smiles", type=Path, default=None)
     parser.add_argument("--out", type=Path, default=ROOT / "outputs/eval_metrics.json")
     parser.add_argument("--rediscovery-threshold", type=float, default=0.7)
+    parser.add_argument(
+        "--expected-total",
+        type=int,
+        default=None,
+        help="Pad missing/failed generations with None so validity is computed against the attempted sample count.",
+    )
     return parser.parse_args()
 
 
@@ -36,6 +42,8 @@ def main() -> None:
         generated = load_mols_from_sdf(args.generated_sdf)
     else:
         generated = mols_from_smiles(load_smiles(args.generated_smiles))
+    if args.expected_total is not None and args.expected_total > len(generated):
+        generated.extend([None] * (args.expected_total - len(generated)))
     references = mols_from_smiles(load_smiles(args.reference_smiles)) if args.reference_smiles else None
     sources = mols_from_smiles(load_smiles(args.source_smiles)) if args.source_smiles else None
     metrics = compute_molecule_metrics(

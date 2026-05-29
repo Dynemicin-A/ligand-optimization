@@ -43,4 +43,5 @@ python scripts/evaluate_molecules.py \
   --generated-sdf "$SAMPLE_DIR/sdf" \
   --reference-smiles "$SAMPLE_DIR/reference.smi" \
   --source-smiles "$SAMPLE_DIR/source.smi" \
-  --out "$EVAL_OUT"
+  --out "$EVAL_OUT" \
+  --expected-total "$NUM_SAMPLES"
