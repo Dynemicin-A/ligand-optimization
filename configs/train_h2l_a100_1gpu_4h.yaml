@@ -1,0 +1,43 @@
+seed: 2024
+
+model:
+  num_ligand_atom_types: 16
+  num_protein_atom_types: 32
+  num_bond_types: 5
+  hidden_dim: 256
+  time_dim: 128
+  rbf_dim: 48
+  num_blocks: 8
+  ligand_knn: 24
+  protein_knn: 32
+  cross_knn: 48
+  source_knn: 24
+  cutoff: 12.0
+
+diffusion:
+  num_timesteps: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+  atom_mask_token: 15
+  pos_loss_weight: 1.0
+  atom_loss_weight: 1.0
+  bond_loss_weight: 0.2
+
+data:
+  kind: pt_manifest
+  manifest: data/processed_h2l/train/manifest.txt
+
+train:
+  batch_size: 8
+  num_workers: 2
+  pin_memory: true
+  drop_last: true
+  valid_fraction: 0.03
+  max_steps: 1000000
+  lr: 0.0001
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  log_every: 50
+  valid_every: 1500
+  valid_batches: 32
+  save_every: 1500
