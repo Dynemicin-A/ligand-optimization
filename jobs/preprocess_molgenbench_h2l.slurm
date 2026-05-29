@@ -32,7 +32,16 @@ fi
 if [ "${GLOBAL_RANDOM_ROTATE:-}" = "1" ]; then
   PAIR_ARGS+=(--global-random-rotate)
 fi
-for arg in GLOBAL_TRANSLATE_SIGMA LIGAND_NOISE_SIGMA SOURCE_NOISE_SIGMA PROTEIN_NOISE_SIGMA; do
+if [ "${HARD_NEGATIVE_MODE:-}" != "" ]; then
+  PAIR_ARGS+=(--hard-negative-mode "$HARD_NEGATIVE_MODE")
+fi
+if [ "${HARD_NEGATIVE_MIN_TARGET_SIMILARITY:-}" != "" ]; then
+  PAIR_ARGS+=(--hard-negative-min-target-similarity "$HARD_NEGATIVE_MIN_TARGET_SIMILARITY")
+fi
+if [ "${HARD_NEGATIVE_SCORE_SLACK:-}" != "" ]; then
+  PAIR_ARGS+=(--hard-negative-score-slack "$HARD_NEGATIVE_SCORE_SLACK")
+fi
+for arg in GLOBAL_TRANSLATE_SIGMA LIGAND_NOISE_SIGMA SOURCE_NOISE_SIGMA PROTEIN_NOISE_SIGMA NEGATIVE_NOISE_SIGMA; do
   value="${!arg:-}"
   if [ "$value" != "" ]; then
     option="$(echo "$arg" | tr '[:upper:]_' '[:lower:]-')"

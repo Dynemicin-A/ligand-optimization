@@ -11,6 +11,8 @@ from pathlib import Path
 
 import torch
 from rdkit import Chem
+from rdkit import DataStructs
+from rdkit.Chem import rdFingerprintGenerator
 from tqdm.auto import tqdm
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,6 +33,34 @@ class H2LSeries:
     protein_path: Path
     source_ligand_path: Path
     target_ligand_path: Path
+
+
+@dataclass(frozen=True)
+class SeriesMol:
+    label: str
+    index: int
+    mol: Chem.Mol
+    path: Path
+    target_index: int | None
+    score: float | None
+
+
+@dataclass(frozen=True)
+class PairDef:
+    source_label: str
+    source_index: int
+    source_mol: Chem.Mol
+    source_path: Path
+    target_index: int
+    target_mol: Chem.Mol
+    source_score: float | None
+    target_score: float | None
+    negative_label: str | None = None
+    negative_index: int | None = None
+    negative_mol: Chem.Mol | None = None
+    negative_path: Path | None = None
+    negative_score: float | None = None
+    negative_similarity: float | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,6 +92,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ligand-noise-sigma", type=float, default=0.0)
     parser.add_argument("--source-noise-sigma", type=float, default=0.0)
     parser.add_argument("--protein-noise-sigma", type=float, default=0.0)
+    parser.add_argument("--negative-noise-sigma", type=float, default=0.03)
+    parser.add_argument(
+        "--hard-negative-mode",
+        choices=["none", "within_series"],
+        default="none",
+        help="Attach one same-pocket low-activity hard negative per positive pair when available.",
+    )
+    parser.add_argument("--hard-negative-min-target-similarity", type=float, default=0.2)
+    parser.add_argument("--hard-negative-score-slack", type=float, default=0.0)
     return parser.parse_args()
 
 
@@ -120,6 +159,20 @@ def activity_score(mol: Chem.Mol) -> float | None:
     return value if higher_is_better else -value
 
 
+_FP_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
+
+
+def mol_fingerprint(mol: Chem.Mol):
+    return _FP_GENERATOR.GetFingerprint(Chem.RemoveHs(mol))
+
+
+def mol_similarity(lhs: Chem.Mol, rhs: Chem.Mol) -> float:
+    try:
+        return float(DataStructs.TanimotoSimilarity(mol_fingerprint(lhs), mol_fingerprint(rhs)))
+    except Exception:
+        return 0.0
+
+
 def random_rotation(generator: torch.Generator) -> torch.Tensor:
     q = torch.randn(4, generator=generator)
     q = q / q.norm().clamp_min(1e-8)
@@ -142,7 +195,7 @@ def augment_record(record: dict, args: argparse.Namespace, aug_idx: int, seed_of
         for key, value in record.items()
     }
     generator = torch.Generator().manual_seed(args.augment_seed + seed_offset * 1009 + aug_idx)
-    pos_keys = ["protein_pos", "source_pos", "ligand_pos"]
+    pos_keys = [key for key in ["protein_pos", "source_pos", "ligand_pos", "negative_ligand_pos"] if key in out]
     if args.global_random_rotate:
         rot = random_rotation(generator)
         for key in pos_keys:
@@ -155,8 +208,9 @@ def augment_record(record: dict, args: argparse.Namespace, aug_idx: int, seed_of
         ("protein_pos", args.protein_noise_sigma),
         ("source_pos", args.source_noise_sigma),
         ("ligand_pos", args.ligand_noise_sigma),
+        ("negative_ligand_pos", args.negative_noise_sigma),
     ]:
-        if sigma > 0:
+        if key in out and sigma > 0:
             out[key] = out[key] + torch.randn(out[key].shape, generator=generator) * sigma
     return out
 
@@ -166,18 +220,72 @@ def build_pairs(
     source_mol: Chem.Mol,
     target_mols: list[Chem.Mol],
     args: argparse.Namespace,
-) -> list[tuple[str, int, Chem.Mol, Path, int, Chem.Mol]]:
+) -> list[PairDef]:
+    pool = build_pool(item, source_mol, target_mols)
     if args.pair_mode == "reference_to_targets":
-        return [
-            ("ref", 0, source_mol, item.source_ligand_path, target_index, target_mol)
+        pairs = [
+            PairDef(
+                source_label="ref",
+                source_index=0,
+                source_mol=source_mol,
+                source_path=item.source_ligand_path,
+                target_index=target_index,
+                target_mol=target_mol,
+                source_score=activity_score(source_mol),
+                target_score=activity_score(target_mol),
+            )
             for target_index, target_mol in enumerate(target_mols)
         ]
+        return attach_hard_negatives(pairs, pool, args)
 
-    pool: list[tuple[str, int, Chem.Mol, Path, int | None, float | None]] = [
-        ("ref", 0, source_mol, item.source_ligand_path, None, activity_score(source_mol))
+    scored = [entry for entry in pool if entry.score is not None]
+    if len(scored) < 2:
+        pairs = [
+            PairDef(
+                source_label="ref",
+                source_index=0,
+                source_mol=source_mol,
+                source_path=item.source_ligand_path,
+                target_index=target_index,
+                target_mol=target_mol,
+                source_score=activity_score(source_mol),
+                target_score=activity_score(target_mol),
+            )
+            for target_index, target_mol in enumerate(target_mols)
+        ]
+        return attach_hard_negatives(pairs, pool, args)
+
+    pairs: list[PairDef] = []
+    for low in scored:
+        assert low.score is not None
+        for high in scored:
+            assert high.score is not None
+            if high.target_index is None or low.mol is high.mol:
+                continue
+            if high.score > low.score + args.min_activity_delta:
+                pairs.append(
+                    PairDef(
+                        source_label=low.label,
+                        source_index=low.index,
+                        source_mol=low.mol,
+                        source_path=low.path,
+                        target_index=high.target_index,
+                        target_mol=high.mol,
+                        source_score=low.score,
+                        target_score=high.score,
+                    )
+                )
+            if args.max_pairs_per_series is not None and len(pairs) >= args.max_pairs_per_series:
+                return attach_hard_negatives(pairs, pool, args)
+    return attach_hard_negatives(pairs, pool, args)
+
+
+def build_pool(item: H2LSeries, source_mol: Chem.Mol, target_mols: list[Chem.Mol]) -> list[SeriesMol]:
+    pool = [
+        SeriesMol("ref", 0, source_mol, item.source_ligand_path, None, activity_score(source_mol))
     ]
     pool.extend(
-        (
+        SeriesMol(
             f"t{target_index:04d}",
             target_index,
             target_mol,
@@ -187,25 +295,52 @@ def build_pairs(
         )
         for target_index, target_mol in enumerate(target_mols)
     )
-    scored = [entry for entry in pool if entry[-1] is not None]
-    if len(scored) < 2:
-        return [
-            ("ref", 0, source_mol, item.source_ligand_path, target_index, target_mol)
-            for target_index, target_mol in enumerate(target_mols)
-        ]
+    return pool
 
-    pairs: list[tuple[str, int, Chem.Mol, Path, int, Chem.Mol]] = []
-    for source_label, source_index, low_mol, source_path, _source_target_index, low_score in scored:
-        assert low_score is not None
-        for _target_label, target_index, high_mol, _target_path, target_target_index, high_score in scored:
-            assert high_score is not None
-            if target_target_index is None or low_mol is high_mol:
-                continue
-            if high_score > low_score + args.min_activity_delta:
-                pairs.append((source_label, source_index, low_mol, source_path, target_index, high_mol))
-            if args.max_pairs_per_series is not None and len(pairs) >= args.max_pairs_per_series:
-                return pairs
-    return pairs
+
+def attach_hard_negatives(pairs: list[PairDef], pool: list[SeriesMol], args: argparse.Namespace) -> list[PairDef]:
+    if args.hard_negative_mode == "none":
+        return pairs
+    return [attach_hard_negative(pair, pool, args) for pair in pairs]
+
+
+def attach_hard_negative(pair: PairDef, pool: list[SeriesMol], args: argparse.Namespace) -> PairDef:
+    candidates: list[tuple[float, float, SeriesMol]] = []
+    for candidate in pool:
+        if candidate.mol is pair.target_mol:
+            continue
+        if candidate.score is not None and pair.target_score is not None and candidate.score >= pair.target_score:
+            continue
+        if (
+            candidate.score is not None
+            and pair.source_score is not None
+            and candidate.score > pair.source_score + args.hard_negative_score_slack
+        ):
+            continue
+        similarity = mol_similarity(candidate.mol, pair.target_mol)
+        if similarity < args.hard_negative_min_target_similarity:
+            continue
+        score_key = candidate.score if candidate.score is not None else float("-inf")
+        candidates.append((similarity, score_key, candidate))
+    if not candidates:
+        return pair
+    similarity, _score_key, chosen = max(candidates, key=lambda item: (item[0], -item[1]))
+    return PairDef(
+        source_label=pair.source_label,
+        source_index=pair.source_index,
+        source_mol=pair.source_mol,
+        source_path=pair.source_path,
+        target_index=pair.target_index,
+        target_mol=pair.target_mol,
+        source_score=pair.source_score,
+        target_score=pair.target_score,
+        negative_label=chosen.label,
+        negative_index=chosen.index,
+        negative_mol=chosen.mol,
+        negative_path=chosen.path,
+        negative_score=chosen.score,
+        negative_similarity=similarity,
+    )
 
 
 def main() -> None:
@@ -241,17 +376,18 @@ def main() -> None:
             )
             continue
 
-        for pair_index, (source_label, source_index, source_mol, source_path, target_index, target_mol) in enumerate(pair_defs):
+        for pair_index, pair in enumerate(pair_defs):
             if max_records is not None and len(manifest_paths) >= max_records:
                 break
             try:
-                source = mol_to_record_tensors(source_mol)
-                target = mol_to_record_tensors(target_mol)
+                source = mol_to_record_tensors(pair.source_mol)
+                target = mol_to_record_tensors(pair.target_mol)
+                negative = mol_to_record_tensors(pair.negative_mol) if pair.negative_mol is not None else None
                 protein = crop_protein_to_ligand(protein_full, source["pos"], args.pocket_radius)
                 base_record_id = (
-                    f"{item.target_id}_{item.series_id}_{target_index:04d}"
+                    f"{item.target_id}_{item.series_id}_{pair.target_index:04d}"
                     if args.pair_mode == "reference_to_targets" and args.augment_copies == 1
-                    else f"{item.target_id}_{item.series_id}_{source_label}_to_t{target_index:04d}"
+                    else f"{item.target_id}_{item.series_id}_{pair.source_label}_to_t{pair.target_index:04d}"
                 )
                 for aug_idx in range(max(1, args.augment_copies)):
                     if max_records is not None and len(manifest_paths) >= max_records:
@@ -264,8 +400,8 @@ def main() -> None:
                         "target_id": item.target_id,
                         "series_id": item.series_id,
                         "pair_index": pair_index,
-                        "source_index": source_index,
-                        "target_index": target_index,
+                        "source_index": pair.source_index,
+                        "target_index": pair.target_index,
                         "augmentation_index": aug_idx,
                         "protein_atom_type": protein["atom_type"],
                         "protein_pos": protein["pos"],
@@ -276,15 +412,31 @@ def main() -> None:
                         "ligand_bond_edge_index": target["bond_edge_index"],
                         "ligand_bond_type": target["bond_type"],
                         "protein_path": str(item.protein_path.resolve()),
-                        "source_ligand_path": str(source_path.resolve()),
+                        "source_ligand_path": str(pair.source_path.resolve()),
                         "target_ligand_path": str(item.target_ligand_path.resolve()),
-                        "source_affinity": prop(source_mol, "Affinity"),
-                        "source_affinity_type": prop(source_mol, "Affinity Type"),
-                        "source_affinity_unit": prop(source_mol, "Affinity Unit"),
-                        "target_affinity": prop(target_mol, "Affinity"),
-                        "target_affinity_type": prop(target_mol, "Affinity Type"),
-                        "target_affinity_unit": prop(target_mol, "Affinity Unit"),
+                        "source_affinity": prop(pair.source_mol, "Affinity"),
+                        "source_affinity_type": prop(pair.source_mol, "Affinity Type"),
+                        "source_affinity_unit": prop(pair.source_mol, "Affinity Unit"),
+                        "target_affinity": prop(pair.target_mol, "Affinity"),
+                        "target_affinity_type": prop(pair.target_mol, "Affinity Type"),
+                        "target_affinity_unit": prop(pair.target_mol, "Affinity Unit"),
                     }
+                    if negative is not None:
+                        record.update(
+                            {
+                                "negative_label": pair.negative_label,
+                                "negative_index": pair.negative_index,
+                                "negative_ligand_atom_type": negative["atom_type"],
+                                "negative_ligand_pos": negative["pos"],
+                                "negative_ligand_bond_edge_index": negative["bond_edge_index"],
+                                "negative_ligand_bond_type": negative["bond_type"],
+                                "negative_ligand_path": str(pair.negative_path.resolve()) if pair.negative_path else "",
+                                "negative_affinity": prop(pair.negative_mol, "Affinity") if pair.negative_mol else "",
+                                "negative_affinity_type": prop(pair.negative_mol, "Affinity Type") if pair.negative_mol else "",
+                                "negative_affinity_unit": prop(pair.negative_mol, "Affinity Unit") if pair.negative_mol else "",
+                                "negative_similarity_to_target": pair.negative_similarity,
+                            }
+                        )
                     record = augment_record(record, args, aug_idx, len(manifest_paths))
                     torch.save(record, out_path)
                     manifest_paths.append(out_path.resolve())
@@ -294,18 +446,25 @@ def main() -> None:
                             "target_id": item.target_id,
                             "series_id": item.series_id,
                             "pair_index": str(pair_index),
-                            "source_index": str(source_index),
-                            "target_index": str(target_index),
+                            "source_index": str(pair.source_index),
+                            "target_index": str(pair.target_index),
                             "augmentation_index": str(aug_idx),
                             "protein_path": str(item.protein_path.resolve()),
-                            "source_ligand_path": str(source_path.resolve()),
+                            "source_ligand_path": str(pair.source_path.resolve()),
                             "target_ligand_path": str(item.target_ligand_path.resolve()),
-                            "source_affinity": prop(source_mol, "Affinity"),
-                            "source_affinity_type": prop(source_mol, "Affinity Type"),
-                            "source_affinity_unit": prop(source_mol, "Affinity Unit"),
-                            "target_affinity": prop(target_mol, "Affinity"),
-                            "target_affinity_type": prop(target_mol, "Affinity Type"),
-                            "target_affinity_unit": prop(target_mol, "Affinity Unit"),
+                            "source_affinity": prop(pair.source_mol, "Affinity"),
+                            "source_affinity_type": prop(pair.source_mol, "Affinity Type"),
+                            "source_affinity_unit": prop(pair.source_mol, "Affinity Unit"),
+                            "target_affinity": prop(pair.target_mol, "Affinity"),
+                            "target_affinity_type": prop(pair.target_mol, "Affinity Type"),
+                            "target_affinity_unit": prop(pair.target_mol, "Affinity Unit"),
+                            "negative_label": pair.negative_label or "",
+                            "negative_index": "" if pair.negative_index is None else str(pair.negative_index),
+                            "negative_ligand_path": str(pair.negative_path.resolve()) if pair.negative_path else "",
+                            "negative_affinity": prop(pair.negative_mol, "Affinity") if pair.negative_mol else "",
+                            "negative_affinity_type": prop(pair.negative_mol, "Affinity Type") if pair.negative_mol else "",
+                            "negative_affinity_unit": prop(pair.negative_mol, "Affinity Unit") if pair.negative_mol else "",
+                            "negative_similarity_to_target": "" if pair.negative_similarity is None else f"{pair.negative_similarity:.6f}",
                         }
                     )
             except Exception as exc:
@@ -313,8 +472,8 @@ def main() -> None:
                     {
                         "target_id": item.target_id,
                         "series_id": item.series_id,
-                        "source_index": str(source_index),
-                        "target_index": str(target_index),
+                        "source_index": str(pair.source_index),
+                        "target_index": str(pair.target_index),
                         "error": repr(exc),
                     }
                 )
@@ -343,6 +502,13 @@ def main() -> None:
                 "target_affinity",
                 "target_affinity_type",
                 "target_affinity_unit",
+                "negative_label",
+                "negative_index",
+                "negative_ligand_path",
+                "negative_affinity",
+                "negative_affinity_type",
+                "negative_affinity_unit",
+                "negative_similarity_to_target",
             ],
         )
         writer.writeheader()

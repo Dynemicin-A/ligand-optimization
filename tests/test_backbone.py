@@ -77,7 +77,11 @@ def test_diffusion_training_loss():
     backbone = ComplexDenoiserBackbone(config)
     diffusion = ProteinConditionedDiffusion(
         backbone,
-        DiffusionConfig(num_timesteps=32, atom_mask_token=config.num_ligand_atom_types - 1),
+        DiffusionConfig(
+            num_timesteps=32,
+            atom_mask_token=config.num_ligand_atom_types - 1,
+            hard_negative_loss_weight=0.1,
+        ),
     )
 
     batch = {
@@ -92,11 +96,16 @@ def test_diffusion_training_loss():
         "source_atom_type": torch.randint(0, config.num_ligand_atom_types - 1, (7,)),
         "source_pos": torch.randn(7, 3),
         "source_batch": torch.tensor([0] * 3 + [1] * 4),
+        "negative_ligand_atom_type": torch.randint(0, config.num_ligand_atom_types - 1, (8,)),
+        "negative_ligand_pos": torch.randn(8, 3),
+        "negative_ligand_batch": torch.tensor([0] * 3 + [1] * 5),
     }
 
     out = diffusion.training_loss(batch)
     assert out["loss"].dim() == 0
     assert torch.isfinite(out["loss"])
+    assert out["hard_negative_loss"].dim() == 0
+    assert torch.isfinite(out["hard_negative_loss"])
     out["loss"].backward()
     assert any(p.grad is not None for p in diffusion.parameters())
 

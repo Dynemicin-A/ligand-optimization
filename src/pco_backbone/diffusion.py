@@ -18,6 +18,8 @@ class DiffusionConfig:
     pos_loss_weight: float = 1.0
     atom_loss_weight: float = 1.0
     bond_loss_weight: float = 0.2
+    hard_negative_loss_weight: float = 0.0
+    hard_negative_margin: float = 0.2
 
 
 class ProteinConditionedDiffusion(nn.Module):
@@ -97,6 +99,55 @@ class ProteinConditionedDiffusion(nn.Module):
         pred_src, pred_dst = edge_index
         return dense[pred_src, pred_dst]
 
+    def _hard_negative_loss(
+        self,
+        *,
+        batch: dict[str, torch.Tensor],
+        protein_atom_type: torch.Tensor,
+        protein_pos: torch.Tensor,
+        protein_batch: torch.Tensor,
+        ligand_atom_type: torch.Tensor,
+        ligand_pos: torch.Tensor,
+        ligand_batch: torch.Tensor,
+        n_graphs: int,
+        optional_source: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        zero = ligand_pos.new_zeros(())
+        if (
+            self.config.hard_negative_loss_weight <= 0
+            or "negative_ligand_atom_type" not in batch
+            or batch["negative_ligand_atom_type"].numel() == 0
+        ):
+            return zero, zero, zero
+
+        time_zero = ligand_pos.new_zeros(n_graphs)
+        pos_out = self.backbone(
+            protein_atom_type=protein_atom_type,
+            protein_pos=protein_pos,
+            protein_batch=protein_batch,
+            ligand_atom_type=ligand_atom_type,
+            ligand_pos=ligand_pos,
+            ligand_batch=ligand_batch,
+            time=time_zero,
+            ligand_edge_index=batch.get("ligand_edge_index"),
+            **optional_source,
+        )
+        neg_out = self.backbone(
+            protein_atom_type=protein_atom_type,
+            protein_pos=protein_pos,
+            protein_batch=protein_batch,
+            ligand_atom_type=batch["negative_ligand_atom_type"],
+            ligand_pos=batch["negative_ligand_pos"],
+            ligand_batch=batch["negative_ligand_batch"],
+            time=time_zero,
+            **optional_source,
+        )
+        neg_graphs = torch.unique(batch["negative_ligand_batch"])
+        pos_score = pos_out["complex_score"][neg_graphs]
+        neg_score = neg_out["complex_score"][neg_graphs]
+        ranking = F.relu(self.config.hard_negative_margin - pos_score + neg_score).mean()
+        return ranking, pos_score.mean(), neg_score.mean()
+
     def training_loss(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         protein_atom_type = batch["protein_atom_type"]
         protein_pos = batch["protein_pos"]
@@ -145,16 +196,32 @@ class ProteinConditionedDiffusion(nn.Module):
         else:
             bond_loss = F.cross_entropy(out["bond_logits"], bond_target)
 
+        hard_negative_loss, pos_score_mean, neg_score_mean = self._hard_negative_loss(
+            batch=batch,
+            protein_atom_type=protein_atom_type,
+            protein_pos=protein_pos,
+            protein_batch=protein_batch,
+            ligand_atom_type=ligand_atom_type,
+            ligand_pos=ligand_pos,
+            ligand_batch=ligand_batch,
+            n_graphs=n_graphs,
+            optional_source=optional_source,
+        )
+
         total_loss = (
             self.config.pos_loss_weight * pos_loss
             + self.config.atom_loss_weight * atom_loss
             + self.config.bond_loss_weight * bond_loss
+            + self.config.hard_negative_loss_weight * hard_negative_loss
         )
         return {
             "loss": total_loss,
             "pos_loss": pos_loss.detach(),
             "atom_loss": atom_loss.detach(),
             "bond_loss": bond_loss.detach(),
+            "hard_negative_loss": hard_negative_loss.detach(),
+            "positive_score": pos_score_mean.detach(),
+            "negative_score": neg_score_mean.detach(),
             "time_index": graph_t.detach(),
         }
 

@@ -24,14 +24,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-steps", type=int, default=32)
     parser.add_argument("--num-ligand-atoms", type=int, default=12)
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument(
+        "--weights",
+        choices=["auto", "model", "ema"],
+        default="auto",
+        help="Which checkpoint weights to sample from. auto prefers EMA when present.",
+    )
     return parser.parse_args()
 
 
-def build_model_from_checkpoint(path: Path, device: torch.device) -> ProteinConditionedDiffusion:
+def build_model_from_checkpoint(path: Path, device: torch.device, weights: str) -> ProteinConditionedDiffusion:
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     backbone = ComplexDenoiserBackbone(BackboneConfig(**ckpt["backbone_config"]))
     model = ProteinConditionedDiffusion(backbone, DiffusionConfig(**ckpt["diffusion_config"]))
-    model.load_state_dict(ckpt["model_state"])
+    use_ema = weights in {"auto", "ema"} and "ema_model_state" in ckpt
+    if weights == "ema" and not use_ema:
+        raise KeyError(f"checkpoint has no ema_model_state: {path}")
+    model.load_state_dict(ckpt["ema_model_state"] if use_ema else ckpt["model_state"])
+    print(f"loaded_weights: {'ema' if use_ema else 'model'}")
     return model.to(device)
 
 
@@ -71,7 +81,7 @@ def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
-    model = build_model_from_checkpoint(args.checkpoint, device)
+    model = build_model_from_checkpoint(args.checkpoint, device, args.weights)
     batch = make_condition_batch(model, args.num_ligand_atoms, args.seed)
     batch = move_batch_to_device(batch, device)
     sample = model.sample(batch, num_steps=args.num_steps)

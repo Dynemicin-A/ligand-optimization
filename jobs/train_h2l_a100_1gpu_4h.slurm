@@ -22,7 +22,7 @@ if [ "${RESUME:-}" != "" ]; then
 fi
 INIT_ARG=()
 if [ "${INIT_MODEL:-}" != "" ]; then
-  INIT_ARG=(--init-model "$INIT_MODEL")
+  INIT_ARG=(--init-model "$INIT_MODEL" --init-weights "${INIT_WEIGHTS:-auto}")
 fi
 DATA_ARG=()
 if [ "${DATA_MANIFEST:-}" != "" ]; then

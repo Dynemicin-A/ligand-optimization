@@ -111,12 +111,19 @@ Losses:
 - coordinate noise MSE
 - atom type cross entropy
 - bond type cross entropy on local ligand edges
+- optional hard-negative ranking loss: same-pocket low-activity/non-hit ligand
+  must score below the high-activity target by a margin
 
-Planned additions:
+Regularization and stopping:
+
+- validation-based early stopping on `valid_loss`
+- `checkpoint_best.pt` and EMA weights for sampling/evaluation
+- dropout, weight decay, and random rigid/noisy coordinate augmentation
+
+Reserved ablations:
 
 - source-hit preservation/similarity regularizer for conservative B0
 - optional property/affinity guidance
-- contrastive active-vs-source ranking head
 
 ## 6. Sampling Pipeline
 

@@ -147,6 +147,17 @@ def _coerce_record(record: dict[str, Any]) -> Record:
         out["ligand_bond_type"] = torch.as_tensor(record["ligand_bond_type"]).long()
     else:
         out["ligand_bond_type"] = torch.empty(0, dtype=torch.long)
+    if "negative_ligand_atom_type" in record and "negative_ligand_pos" in record:
+        out["negative_ligand_atom_type"] = torch.as_tensor(record["negative_ligand_atom_type"]).long()
+        out["negative_ligand_pos"] = torch.as_tensor(record["negative_ligand_pos"]).float()
+        if "negative_ligand_bond_edge_index" in record:
+            out["negative_ligand_bond_edge_index"] = torch.as_tensor(record["negative_ligand_bond_edge_index"]).long()
+        else:
+            out["negative_ligand_bond_edge_index"] = torch.empty(2, 0, dtype=torch.long)
+        if "negative_ligand_bond_type" in record:
+            out["negative_ligand_bond_type"] = torch.as_tensor(record["negative_ligand_bond_type"]).long()
+        else:
+            out["negative_ligand_bond_type"] = torch.empty(0, dtype=torch.long)
     return out
 
 
@@ -156,8 +167,11 @@ def collate_complex_records(records: list[Record]) -> Record:
     source_types, source_pos, source_batch = [], [], []
     ligand_types, ligand_pos, ligand_batch = [], [], []
     bond_edges, bond_types = [], []
+    neg_types, neg_pos, neg_batch = [], [], []
+    neg_bond_edges, neg_bond_types = [], []
 
     ligand_offset = 0
+    negative_ligand_offset = 0
     for i, rec in enumerate(records):
         n_protein = rec["protein_atom_type"].shape[0]
         n_source = rec["source_atom_type"].shape[0]
@@ -182,6 +196,18 @@ def collate_complex_records(records: list[Record]) -> Record:
             bond_types.append(bond_type)
         ligand_offset += n_ligand
 
+        if "negative_ligand_atom_type" in rec:
+            n_negative = rec["negative_ligand_atom_type"].shape[0]
+            neg_types.append(rec["negative_ligand_atom_type"])
+            neg_pos.append(rec["negative_ligand_pos"])
+            neg_batch.append(torch.full((n_negative,), i, dtype=torch.long))
+            neg_edge = rec.get("negative_ligand_bond_edge_index")
+            neg_bond_type = rec.get("negative_ligand_bond_type")
+            if neg_edge is not None and neg_edge.numel() > 0:
+                neg_bond_edges.append(neg_edge + negative_ligand_offset)
+                neg_bond_types.append(neg_bond_type)
+            negative_ligand_offset += n_negative
+
     batch["protein_atom_type"] = torch.cat(protein_types, dim=0)
     batch["protein_pos"] = torch.cat(protein_pos, dim=0)
     batch["protein_batch"] = torch.cat(protein_batch, dim=0)
@@ -198,6 +224,16 @@ def collate_complex_records(records: list[Record]) -> Record:
     else:
         batch["ligand_bond_edge_index"] = torch.empty(2, 0, dtype=torch.long)
         batch["ligand_bond_type"] = torch.empty(0, dtype=torch.long)
+    if neg_types:
+        batch["negative_ligand_atom_type"] = torch.cat(neg_types, dim=0)
+        batch["negative_ligand_pos"] = torch.cat(neg_pos, dim=0)
+        batch["negative_ligand_batch"] = torch.cat(neg_batch, dim=0)
+        if neg_bond_edges:
+            batch["negative_ligand_edge_index"] = torch.cat(neg_bond_edges, dim=1)
+            batch["negative_ligand_bond_type"] = torch.cat(neg_bond_types, dim=0)
+        else:
+            batch["negative_ligand_edge_index"] = torch.empty(2, 0, dtype=torch.long)
+            batch["negative_ligand_bond_type"] = torch.empty(0, dtype=torch.long)
     return batch
 
 

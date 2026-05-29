@@ -60,6 +60,13 @@ Optional bond labels:
 - `ligand_bond_edge_index`
 - `ligand_bond_type`
 
+Optional hard-negative labels used by the ranking loss:
+
+- `negative_ligand_atom_type`
+- `negative_ligand_pos`
+- `negative_ligand_bond_edge_index`
+- `negative_ligand_bond_type`
+
 ## Expanded H2L Pairs And Augmentation
 
 The MolGenBench H2L preprocessor can expand each target series from only
@@ -75,7 +82,10 @@ python3 scripts/preprocess_molgenbench_h2l.py \
   --global-random-rotate \
   --global-translate-sigma 0.5 \
   --ligand-noise-sigma 0.05 \
-  --source-noise-sigma 0.03
+  --source-noise-sigma 0.03 \
+  --negative-noise-sigma 0.03 \
+  --hard-negative-mode within_series \
+  --hard-negative-min-target-similarity 0.2
 ```
 
 On Slurm, use the existing job with env overrides:
@@ -87,13 +97,17 @@ GLOBAL_RANDOM_ROTATE=1 \
 GLOBAL_TRANSLATE_SIGMA=0.5 \
 LIGAND_NOISE_SIGMA=0.05 \
 SOURCE_NOISE_SIGMA=0.03 \
+NEGATIVE_NOISE_SIGMA=0.03 \
+HARD_NEGATIVE_MODE=within_series \
+HARD_NEGATIVE_MIN_TARGET_SIMILARITY=0.2 \
 OUTDIR=/home/scc/pb22000262/ligand-optimization/data/processed_h2l_expanded/train \
 sbatch jobs/preprocess_molgenbench_h2l.slurm
 ```
 
 The regularized A100 H2L config now uses a smaller backbone, dropout, higher
-weight decay, validation every 1000 steps, and early stopping. It writes
-`checkpoint_best.pt` whenever `valid_loss` improves.
+weight decay, EMA validation/sampling, hard-negative ranking loss, validation
+every 1000 steps, and early stopping. It writes `checkpoint_best.pt` whenever
+`valid_loss` improves.
 
 ## Pretrain Then Finetune
 
@@ -126,7 +140,14 @@ sbatch jobs/train_h2l_a100_1gpu_4h.slurm
 ```
 
 Use `checkpoint_best.pt` for final sampling/evaluation rather than the last
-checkpoint if validation has plateaued or regressed.
+checkpoint if validation has plateaued or regressed. Sampling uses EMA weights
+automatically when the checkpoint contains `ema_model_state`.
+
+MolGenBench H2L should be treated as a held-out benchmark for the paper-grade
+run. Do not use the MolGenBench H2L test split as the main training source;
+pretrain on broad SBDD complexes and finetune on non-overlapping H2L pairs, then
+point `MANIFEST` in `jobs/sample_eval_h2l_after_train.slurm` at the held-out
+MolGenBench H2L manifest for evaluation only.
 
 ## Preprocess Real H2L Triples
 

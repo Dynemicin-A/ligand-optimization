@@ -23,6 +23,8 @@ diffusion:
   pos_loss_weight: 1.0
   atom_loss_weight: 1.0
   bond_loss_weight: 0.2
+  hard_negative_loss_weight: 0.1
+  hard_negative_margin: 0.2
 
 data:
   kind: pt_manifest
@@ -42,11 +44,15 @@ train:
   valid_every: 1000
   valid_batches: 32
   save_every: 500
+  ema:
+    enabled: true
+    decay: 0.999
+    validate: true
   early_stopping:
     enabled: true
     monitor: valid_loss
     mode: min
-    min_delta: 0.005
+    min_delta: 0.01
     patience: 3
     start_after: 6000
     save_best: true

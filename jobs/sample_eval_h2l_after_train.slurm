@@ -18,6 +18,7 @@ MANIFEST="${MANIFEST:-data/processed_h2l/train/manifest.txt}"
 SAMPLE_DIR="${SAMPLE_DIR:-${RUN_DIR}/generated_sdf}"
 NUM_SAMPLES="${NUM_SAMPLES:-256}"
 NUM_STEPS="${NUM_STEPS:-64}"
+WEIGHTS="${WEIGHTS:-auto}"
 EVAL_OUT="${EVAL_OUT:-${RUN_DIR}/eval_metrics.json}"
 
 cd "$REPO_DIR"
@@ -51,7 +52,8 @@ python scripts/sample_h2l_manifest.py \
   --outdir "$SAMPLE_DIR" \
   --device cuda \
   --num-samples "$NUM_SAMPLES" \
-  --num-steps "$NUM_STEPS"
+  --num-steps "$NUM_STEPS" \
+  --weights "$WEIGHTS"
 
 python scripts/evaluate_molecules.py \
   --generated-sdf "$SAMPLE_DIR/sdf" \

@@ -7,6 +7,7 @@ import os
 import random
 import signal
 import sys
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 from time import time
@@ -56,6 +57,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Load only model weights from a pretraining checkpoint; optimizer and step start fresh.",
+    )
+    parser.add_argument(
+        "--init-weights",
+        choices=["auto", "model", "ema"],
+        default="auto",
+        help="Which checkpoint weights to load for --init-model. auto prefers EMA when present.",
     )
     return parser.parse_args()
 
@@ -137,6 +144,53 @@ def build_model(cfg: dict) -> ProteinConditionedDiffusion:
     return ProteinConditionedDiffusion(backbone, diffusion_cfg)
 
 
+class ModelEMA:
+    def __init__(self, model: torch.nn.Module, decay: float):
+        self.decay = decay
+        self.shadow: dict[str, torch.Tensor] = {}
+        self.reset(model)
+
+    def reset(self, model: torch.nn.Module) -> None:
+        self.shadow = {
+            key: value.detach().clone()
+            for key, value in unwrap_model(model).state_dict().items()
+        }
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        for key, value in unwrap_model(model).state_dict().items():
+            value = value.detach()
+            if key not in self.shadow:
+                self.shadow[key] = value.clone()
+            elif value.is_floating_point():
+                self.shadow[key].mul_(self.decay).add_(value, alpha=1.0 - self.decay)
+            else:
+                self.shadow[key].copy_(value)
+
+    def load_state_dict(self, state: dict[str, torch.Tensor], model: torch.nn.Module) -> None:
+        current = unwrap_model(model).state_dict()
+        self.shadow = {
+            key: value.detach().clone().to(current[key].device) if key in current else value.detach().clone()
+            for key, value in state.items()
+        }
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        return {key: value.detach().cpu().clone() for key, value in self.shadow.items()}
+
+    @contextmanager
+    def apply_to(self, model: torch.nn.Module):
+        raw_model = unwrap_model(model)
+        current = {
+            key: value.detach().clone()
+            for key, value in raw_model.state_dict().items()
+        }
+        raw_model.load_state_dict(self.shadow, strict=False)
+        try:
+            yield
+        finally:
+            raw_model.load_state_dict(current, strict=False)
+
+
 def split_dataset(dataset, valid_fraction: float, seed: int):
     if valid_fraction <= 0:
         return dataset, None
@@ -191,33 +245,47 @@ def save_checkpoint(
     step: int,
     epoch: int,
     cfg: dict,
+    ema: ModelEMA | None = None,
 ) -> None:
     raw_model = unwrap_model(model)
+    payload = {
+        "step": step,
+        "epoch": epoch,
+        "model_state": raw_model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "config": cfg,
+        "backbone_config": asdict(raw_model.backbone.config),
+        "diffusion_config": asdict(raw_model.config),
+    }
+    if ema is not None:
+        payload["ema_model_state"] = ema.state_dict()
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "step": step,
-            "epoch": epoch,
-            "model_state": raw_model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "config": cfg,
-            "backbone_config": asdict(raw_model.backbone.config),
-            "diffusion_config": asdict(raw_model.config),
-        },
-        path,
-    )
+    torch.save(payload, path)
 
 
-def load_checkpoint(path: Path, model: ProteinConditionedDiffusion, optimizer: torch.optim.Optimizer):
+def load_checkpoint(
+    path: Path,
+    model: ProteinConditionedDiffusion,
+    optimizer: torch.optim.Optimizer,
+    ema: ModelEMA | None = None,
+):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt["model_state"])
     optimizer.load_state_dict(ckpt["optimizer_state"])
-    return int(ckpt.get("step", 0)), int(ckpt.get("epoch", 0))
+    loaded_ema = False
+    if ema is not None and "ema_model_state" in ckpt:
+        ema.load_state_dict(ckpt["ema_model_state"], model)
+        loaded_ema = True
+    return int(ckpt.get("step", 0)), int(ckpt.get("epoch", 0)), loaded_ema
 
 
-def load_model_weights(path: Path, model: ProteinConditionedDiffusion) -> None:
+def load_model_weights(path: Path, model: ProteinConditionedDiffusion, weights: str = "auto") -> str:
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    model.load_state_dict(ckpt["model_state"])
+    use_ema = weights in {"auto", "ema"} and "ema_model_state" in ckpt
+    if weights == "ema" and not use_ema:
+        raise KeyError(f"checkpoint has no ema_model_state: {path}")
+    model.load_state_dict(ckpt["ema_model_state"] if use_ema else ckpt["model_state"])
+    return "ema" if use_ema else "model"
 
 
 def metric_improved(value: float, best: float | None, mode: str, min_delta: float) -> bool:
@@ -285,17 +353,25 @@ def main() -> None:
         lr=train_cfg.get("lr", 1e-4),
         weight_decay=train_cfg.get("weight_decay", 1e-4),
     )
+    ema_cfg = train_cfg.get("ema", {}) or {}
+    ema_enabled = bool(ema_cfg.get("enabled", False))
+    ema = ModelEMA(model, decay=float(ema_cfg.get("decay", 0.999))) if ema_enabled else None
+    ema_validate = bool(ema_cfg.get("validate", True))
 
     step = 0
     start_epoch = 0
     if args.resume is not None and args.init_model is not None:
         raise ValueError("--resume and --init-model are mutually exclusive")
     if args.resume is not None:
-        step, start_epoch = load_checkpoint(args.resume, model, optimizer)
+        step, start_epoch, loaded_ema = load_checkpoint(args.resume, model, optimizer, ema=ema)
+        if ema is not None and not loaded_ema:
+            ema.reset(model)
     elif args.init_model is not None:
-        load_model_weights(args.init_model, model)
+        loaded_weights = load_model_weights(args.init_model, model, weights=args.init_weights)
+        if ema is not None:
+            ema.reset(model)
         if main_process:
-            print(f"initialized model weights from {args.init_model}", flush=True)
+            print(f"initialized {loaded_weights} weights from {args.init_model}", flush=True)
     if distributed:
         model = DistributedDataParallel(
             model,
@@ -348,6 +424,8 @@ def main() -> None:
             if grad_clip is not None and grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
+            if ema is not None:
+                ema.update(model)
 
             step += 1
             pbar.update(1)
@@ -361,6 +439,9 @@ def main() -> None:
                     "train_pos_loss": float(out["pos_loss"].detach().cpu()),
                     "train_atom_loss": float(out["atom_loss"].detach().cpu()),
                     "train_bond_loss": float(out["bond_loss"].detach().cpu()),
+                    "train_hard_negative_loss": float(out["hard_negative_loss"].detach().cpu()),
+                    "train_positive_score": float(out["positive_score"].detach().cpu()),
+                    "train_negative_score": float(out["negative_score"].detach().cpu()),
                     "lr": optimizer.param_groups[0]["lr"],
                 }
                 pbar.set_postfix(loss=f"{log['train_loss']:.4f}")
@@ -368,9 +449,18 @@ def main() -> None:
                     f.write(json.dumps(log) + "\n")
 
             if valid_loader is not None and step % valid_every == 0:
-                valid_metrics = evaluate(unwrap_model(model), valid_loader, device, valid_batches)
+                eval_model = unwrap_model(model)
+                if ema is not None and ema_validate:
+                    with ema.apply_to(eval_model):
+                        valid_metrics = evaluate(eval_model, valid_loader, device, valid_batches)
+                else:
+                    valid_metrics = evaluate(eval_model, valid_loader, device, valid_batches)
                 if main_process:
-                    log = {"step": step, **{f"valid_{k}": v for k, v in valid_metrics.items()}}
+                    log = {
+                        "step": step,
+                        "valid_weights": "ema" if ema is not None and ema_validate else "model",
+                        **{f"valid_{k}": v for k, v in valid_metrics.items()},
+                    }
                     if early_enabled:
                         monitored = log.get(early_monitor)
                         if monitored is None:
@@ -382,7 +472,7 @@ def main() -> None:
                             best_step = step
                             bad_validations = 0
                             if early_save_best:
-                                save_checkpoint(args.outdir / "checkpoint_best.pt", model, optimizer, step, epoch, cfg)
+                                save_checkpoint(args.outdir / "checkpoint_best.pt", model, optimizer, step, epoch, cfg, ema=ema)
                         elif step >= early_start_after:
                             bad_validations += 1
                         log.update(
@@ -409,7 +499,7 @@ def main() -> None:
                 dist.barrier()
 
             if main_process and step % save_every == 0:
-                save_checkpoint(args.outdir / f"checkpoint_step_{step}.pt", model, optimizer, step, epoch, cfg)
+                save_checkpoint(args.outdir / f"checkpoint_step_{step}.pt", model, optimizer, step, epoch, cfg, ema=ema)
             if distributed and step % save_every == 0:
                 dist.barrier()
 
@@ -419,7 +509,7 @@ def main() -> None:
 
     pbar.close()
     if main_process:
-        save_checkpoint(args.outdir / "checkpoint_last.pt", model, optimizer, step, epoch, cfg)
+        save_checkpoint(args.outdir / "checkpoint_last.pt", model, optimizer, step, epoch, cfg, ema=ema)
         print(f"done: step={step}, checkpoint={args.outdir / 'checkpoint_last.pt'}")
     if distributed:
         dist.barrier()
