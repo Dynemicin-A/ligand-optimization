@@ -27,9 +27,11 @@ python3 scripts/sample_diffusion.py \
 ## Main Pipeline
 
 1. Preprocess H2L triples: protein pocket, low-activity source hit, high-activity target lead.
-2. Train diffusion denoiser with protein and source-hit conditioning.
-3. Sample optimized full molecules.
-4. Export tensor/SDF artifacts.
-5. Evaluate chemical quality, active rediscovery, structure-based quality, and scaffold migration.
+2. Expand H2L pairs within each activity series and apply geometry augmentation.
+3. Pretrain on broad protein-ligand complexes, then finetune on expanded H2L pairs.
+4. Train diffusion denoiser with validation-based early stopping and best-checkpoint selection.
+5. Sample optimized full molecules.
+6. Export tensor/SDF artifacts.
+7. Evaluate chemical quality, active rediscovery, structure-based quality, and scaffold migration.
 
 See [PIPELINE.md](</Users/z/Desktop/ligand- optimization/PIPELINE.md>) for the paper-grade pipeline and [RUNNING.md](</Users/z/Desktop/ligand- optimization/RUNNING.md>) for commands.

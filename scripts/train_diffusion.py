@@ -45,6 +45,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--resume", type=Path, default=None)
+    parser.add_argument(
+        "--init-model",
+        type=Path,
+        default=None,
+        help="Load only model weights from a pretraining checkpoint; optimizer and step start fresh.",
+    )
     return parser.parse_args()
 
 
@@ -203,6 +209,21 @@ def load_checkpoint(path: Path, model: ProteinConditionedDiffusion, optimizer: t
     return int(ckpt.get("step", 0)), int(ckpt.get("epoch", 0))
 
 
+def load_model_weights(path: Path, model: ProteinConditionedDiffusion) -> None:
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    model.load_state_dict(ckpt["model_state"])
+
+
+def metric_improved(value: float, best: float | None, mode: str, min_delta: float) -> bool:
+    if best is None:
+        return True
+    if mode == "min":
+        return value < best - min_delta
+    if mode == "max":
+        return value > best + min_delta
+    raise ValueError(f"early_stop.mode must be 'min' or 'max', got {mode!r}")
+
+
 def main() -> None:
     args = parse_args()
     cfg = load_yaml(args.config)
@@ -259,8 +280,14 @@ def main() -> None:
 
     step = 0
     start_epoch = 0
+    if args.resume is not None and args.init_model is not None:
+        raise ValueError("--resume and --init-model are mutually exclusive")
     if args.resume is not None:
         step, start_epoch = load_checkpoint(args.resume, model, optimizer)
+    elif args.init_model is not None:
+        load_model_weights(args.init_model, model)
+        if main_process:
+            print(f"initialized model weights from {args.init_model}", flush=True)
     if distributed:
         model = DistributedDataParallel(
             model,
@@ -275,6 +302,17 @@ def main() -> None:
     valid_every = train_cfg.get("valid_every", 100)
     save_every = train_cfg.get("save_every", 200)
     valid_batches = train_cfg.get("valid_batches", 8)
+    early_cfg = train_cfg.get("early_stopping", {}) or {}
+    early_enabled = bool(early_cfg.get("enabled", False)) and valid_loader is not None
+    early_monitor = early_cfg.get("monitor", "valid_loss")
+    early_mode = early_cfg.get("mode", "min")
+    early_min_delta = float(early_cfg.get("min_delta", 0.0))
+    early_patience = int(early_cfg.get("patience", 3))
+    early_start_after = int(early_cfg.get("start_after", 0))
+    early_save_best = bool(early_cfg.get("save_best", True))
+    best_metric: float | None = None
+    best_step = step
+    bad_validations = 0
 
     metrics_path = args.outdir / "metrics.jsonl"
     start_time = time()
@@ -325,6 +363,38 @@ def main() -> None:
                 valid_metrics = evaluate(unwrap_model(model), valid_loader, device, valid_batches)
                 if main_process:
                     log = {"step": step, **{f"valid_{k}": v for k, v in valid_metrics.items()}}
+                    if early_enabled:
+                        monitored = log.get(early_monitor)
+                        if monitored is None:
+                            raise KeyError(f"early stopping monitor {early_monitor!r} not found in validation log")
+                        monitored = float(monitored)
+                        improved = metric_improved(monitored, best_metric, early_mode, early_min_delta)
+                        if improved:
+                            best_metric = monitored
+                            best_step = step
+                            bad_validations = 0
+                            if early_save_best:
+                                save_checkpoint(args.outdir / "checkpoint_best.pt", model, optimizer, step, epoch, cfg)
+                        elif step >= early_start_after:
+                            bad_validations += 1
+                        log.update(
+                            {
+                                "early_stop_monitor": early_monitor,
+                                "early_stop_value": monitored,
+                                "early_stop_best": best_metric,
+                                "early_stop_best_step": best_step,
+                                "early_stop_bad_validations": bad_validations,
+                            }
+                        )
+                        if step >= early_start_after and bad_validations >= early_patience:
+                            log["early_stop_triggered"] = True
+                            stop_requested["value"] = True
+                            print(
+                                "early stopping: "
+                                f"{early_monitor}={monitored:.6f}, "
+                                f"best={best_metric:.6f} at step={best_step}",
+                                flush=True,
+                            )
                     with metrics_path.open("a") as f:
                         f.write(json.dumps(log) + "\n")
             if distributed and step % valid_every == 0:

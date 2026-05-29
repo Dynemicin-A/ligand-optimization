@@ -154,7 +154,7 @@ def main() -> None:
             )
         generated_smiles.append(mol_smiles_or_empty(mol))
         reference_smiles.append(first_mol_smiles(raw["target_ligand_path"], int(raw.get("target_index", 0))))
-        source_smiles.append(first_mol_smiles(raw["source_ligand_path"], 0))
+        source_smiles.append(first_mol_smiles(raw["source_ligand_path"], int(raw.get("source_index", 0))))
 
     (args.outdir / "generated_sdf_manifest.txt").write_text("\n".join(generated_sdfs) + "\n")
     (args.outdir / "generated.smi").write_text("\n".join(generated_smiles) + "\n")

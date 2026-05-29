@@ -26,16 +26,16 @@ diffusion:
 
 data:
   kind: pt_manifest
-  manifest: data/processed_h2l/train/manifest.txt
+  manifest: data/pretrain_complexes/train/manifest.txt
 
 train:
   batch_size: 8
-  num_workers: 2
+  num_workers: 0
   pin_memory: true
   drop_last: true
   valid_fraction: 0.03
   max_steps: 80000
-  lr: 0.00008
+  lr: 0.0001
   weight_decay: 0.0002
   grad_clip: 1.0
   log_every: 50
@@ -47,6 +47,6 @@ train:
     monitor: valid_loss
     mode: min
     min_delta: 0.005
-    patience: 3
-    start_after: 6000
+    patience: 4
+    start_after: 8000
     save_best: true

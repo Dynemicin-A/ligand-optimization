@@ -60,6 +60,73 @@ Optional bond labels:
 - `ligand_bond_edge_index`
 - `ligand_bond_type`
 
+## Expanded H2L Pairs And Augmentation
+
+The MolGenBench H2L preprocessor can expand each target series from only
+reference-hit-to-lead pairs into all lower-activity to higher-activity pairs
+when affinity metadata is available:
+
+```bash
+python3 scripts/preprocess_molgenbench_h2l.py \
+  --root data/raw/molgenbench_v3/extracted/MolGenBench_Version3 \
+  --outdir data/processed_h2l_expanded/train \
+  --pair-mode all_ordered \
+  --augment-copies 4 \
+  --global-random-rotate \
+  --global-translate-sigma 0.5 \
+  --ligand-noise-sigma 0.05 \
+  --source-noise-sigma 0.03
+```
+
+On Slurm, use the existing job with env overrides:
+
+```bash
+PAIR_MODE=all_ordered \
+AUGMENT_COPIES=4 \
+GLOBAL_RANDOM_ROTATE=1 \
+GLOBAL_TRANSLATE_SIGMA=0.5 \
+LIGAND_NOISE_SIGMA=0.05 \
+SOURCE_NOISE_SIGMA=0.03 \
+OUTDIR=/home/scc/pb22000262/ligand-optimization/data/processed_h2l_expanded/train \
+sbatch jobs/preprocess_molgenbench_h2l.slurm
+```
+
+The regularized A100 H2L config now uses a smaller backbone, dropout, higher
+weight decay, validation every 1000 steps, and early stopping. It writes
+`checkpoint_best.pt` whenever `valid_loss` improves.
+
+## Pretrain Then Finetune
+
+Prepare a pretraining CSV from PDBbind, CrossDocked, Binding MOAD, or another
+protein-ligand complex source:
+
+```csv
+record_id,protein_path,ligand_path
+1abc_0,/path/1abc_pocket.pdb,/path/1abc_ligand.sdf
+```
+
+Preprocess and train the protein-ligand denoising pretrain stage:
+
+```bash
+CSV=/path/to/pretrain_complexes.csv \
+OUTDIR=/home/scc/pb22000262/ligand-optimization/data/pretrain_complexes/train \
+sbatch jobs/preprocess_complex_pretrain.slurm
+
+sbatch jobs/train_pretrain_complexes_a100_1gpu_4h.slurm
+```
+
+Finetune H2L from the pretraining best checkpoint:
+
+```bash
+INIT_MODEL=/home/scc/pb22000262/ligand-optimization/outputs/pretrain_run/checkpoint_best.pt \
+OUTDIR=/home/scc/pb22000262/ligand-optimization/outputs/h2l_finetune_expanded \
+CONFIG=configs/train_h2l_a100_1gpu_4h.yaml \
+sbatch jobs/train_h2l_a100_1gpu_4h.slurm
+```
+
+Use `checkpoint_best.pt` for final sampling/evaluation rather than the last
+checkpoint if validation has plateaued or regressed.
+
 ## Preprocess Real H2L Triples
 
 ```bash

@@ -2,7 +2,7 @@
 #SBATCH -J molgen-h2l-prep
 #SBATCH -p Students
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
+#SBATCH --mem=16G
 #SBATCH -t 02:00:00
 #SBATCH -o logs/molgen-h2l-prep-%j.out
 #SBATCH -e logs/molgen-h2l-prep-%j.err
@@ -16,6 +16,29 @@ MAX_RECORDS_ARG=()
 if [ "${MAX_RECORDS:-}" != "" ]; then
   MAX_RECORDS_ARG=(--max-records "$MAX_RECORDS")
 fi
+PAIR_ARGS=()
+if [ "${PAIR_MODE:-}" != "" ]; then
+  PAIR_ARGS+=(--pair-mode "$PAIR_MODE")
+fi
+if [ "${MIN_ACTIVITY_DELTA:-}" != "" ]; then
+  PAIR_ARGS+=(--min-activity-delta "$MIN_ACTIVITY_DELTA")
+fi
+if [ "${MAX_PAIRS_PER_SERIES:-}" != "" ]; then
+  PAIR_ARGS+=(--max-pairs-per-series "$MAX_PAIRS_PER_SERIES")
+fi
+if [ "${AUGMENT_COPIES:-}" != "" ]; then
+  PAIR_ARGS+=(--augment-copies "$AUGMENT_COPIES")
+fi
+if [ "${GLOBAL_RANDOM_ROTATE:-}" = "1" ]; then
+  PAIR_ARGS+=(--global-random-rotate)
+fi
+for arg in GLOBAL_TRANSLATE_SIGMA LIGAND_NOISE_SIGMA SOURCE_NOISE_SIGMA PROTEIN_NOISE_SIGMA; do
+  value="${!arg:-}"
+  if [ "$value" != "" ]; then
+    option="$(echo "$arg" | tr '[:upper:]_' '[:lower:]-')"
+    PAIR_ARGS+=(--"$option" "$value")
+  fi
+done
 
 cd "$REPO_DIR"
 mkdir -p logs "$OUTDIR"
@@ -27,6 +50,7 @@ python scripts/preprocess_molgenbench_h2l.py \
   --root "$RAW_ROOT" \
   --outdir "$OUTDIR" \
   --pocket-radius "${POCKET_RADIUS:-10.0}" \
+  "${PAIR_ARGS[@]}" \
   "${MAX_RECORDS_ARG[@]}"
 
 python - <<'PY'

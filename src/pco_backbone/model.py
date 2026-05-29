@@ -29,6 +29,7 @@ class BackboneConfig:
     cross_knn: int = 32
     source_knn: int = 16
     cutoff: float = 12.0
+    dropout: float = 0.0
 
 
 class ComplexDenoiserBackbone(nn.Module):
@@ -53,28 +54,34 @@ class ComplexDenoiserBackbone(nn.Module):
 
         self.protein_blocks = nn.ModuleList(
             [
-                ScalarMessageBlock(h, config.rbf_dim, config.time_dim)
+                ScalarMessageBlock(h, config.rbf_dim, config.time_dim, dropout=config.dropout)
                 for _ in range(config.num_blocks)
             ]
         )
         self.ligand_blocks = nn.ModuleList(
             [
-                LigandUpdateBlock(h, config.rbf_dim, config.time_dim)
+                LigandUpdateBlock(h, config.rbf_dim, config.time_dim, dropout=config.dropout)
                 for _ in range(config.num_blocks)
             ]
         )
         self.source_blocks = nn.ModuleList(
             [
-                ScalarMessageBlock(h, config.rbf_dim, config.time_dim)
+                ScalarMessageBlock(h, config.rbf_dim, config.time_dim, dropout=config.dropout)
                 for _ in range(config.num_blocks)
             ]
         )
-        self.source_pool_proj = make_mlp(h, h, h, num_layers=2)
+        self.source_pool_proj = make_mlp(h, h, h, num_layers=2, dropout=config.dropout)
 
-        self.atom_head = make_mlp(h, h, config.num_ligand_atom_types, num_layers=3)
-        self.pos_head = make_mlp(h, h, 3, num_layers=3)
-        self.bond_head = make_mlp(h * 2 + config.rbf_dim, h, config.num_bond_types, num_layers=3)
-        self.global_head = make_mlp(h * 2, h, 1, num_layers=3)
+        self.atom_head = make_mlp(h, h, config.num_ligand_atom_types, num_layers=3, dropout=config.dropout)
+        self.pos_head = make_mlp(h, h, 3, num_layers=3, dropout=config.dropout)
+        self.bond_head = make_mlp(
+            h * 2 + config.rbf_dim,
+            h,
+            config.num_bond_types,
+            num_layers=3,
+            dropout=config.dropout,
+        )
+        self.global_head = make_mlp(h * 2, h, 1, num_layers=3, dropout=config.dropout)
 
     def _edge_rbf(
         self,

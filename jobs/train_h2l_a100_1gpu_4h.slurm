@@ -20,6 +20,10 @@ RESUME_ARG=()
 if [ "${RESUME:-}" != "" ]; then
   RESUME_ARG=(--resume "$RESUME")
 fi
+INIT_ARG=()
+if [ "${INIT_MODEL:-}" != "" ]; then
+  INIT_ARG=(--init-model "$INIT_MODEL")
+fi
 
 cd "$REPO_DIR"
 mkdir -p logs outputs
@@ -43,4 +47,5 @@ python scripts/train_diffusion.py \
   --outdir "$OUTDIR" \
   --device cuda \
   --num-workers "${NUM_WORKERS:-0}" \
+  "${INIT_ARG[@]}" \
   "${RESUME_ARG[@]}"

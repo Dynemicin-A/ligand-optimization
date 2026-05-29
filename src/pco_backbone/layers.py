@@ -13,6 +13,7 @@ def make_mlp(
     num_layers: int = 2,
     activation: type[nn.Module] = nn.SiLU,
     final_activation: nn.Module | None = None,
+    dropout: float = 0.0,
 ) -> nn.Sequential:
     if num_layers < 1:
         raise ValueError("num_layers must be >= 1")
@@ -21,6 +22,8 @@ def make_mlp(
     last_dim = in_dim
     for _ in range(num_layers - 1):
         layers.extend([nn.Linear(last_dim, hidden_dim), activation()])
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
         last_dim = hidden_dim
     layers.append(nn.Linear(last_dim, out_dim))
     if final_activation is not None:
@@ -129,15 +132,16 @@ def build_knn_edges(
 class ScalarMessageBlock(nn.Module):
     """Updates scalar node states from geometric neighbor messages."""
 
-    def __init__(self, hidden_dim: int, rbf_dim: int, time_dim: int):
+    def __init__(self, hidden_dim: int, rbf_dim: int, time_dim: int, dropout: float = 0.0):
         super().__init__()
         self.edge_mlp = make_mlp(
             hidden_dim * 2 + rbf_dim + time_dim,
             hidden_dim,
             hidden_dim,
             num_layers=3,
+            dropout=dropout,
         )
-        self.node_mlp = make_mlp(hidden_dim * 2, hidden_dim, hidden_dim, num_layers=2)
+        self.node_mlp = make_mlp(hidden_dim * 2, hidden_dim, hidden_dim, num_layers=2, dropout=dropout)
 
     def forward(
         self,
@@ -163,16 +167,16 @@ class ScalarMessageBlock(nn.Module):
 class LigandUpdateBlock(nn.Module):
     """Ligand self/cross message passing with equivariant coordinate updates."""
 
-    def __init__(self, hidden_dim: int, rbf_dim: int, time_dim: int):
+    def __init__(self, hidden_dim: int, rbf_dim: int, time_dim: int, dropout: float = 0.0):
         super().__init__()
         edge_in = hidden_dim * 2 + rbf_dim + time_dim
-        self.ll_msg = make_mlp(edge_in, hidden_dim, hidden_dim, num_layers=3)
-        self.pl_msg = make_mlp(edge_in, hidden_dim, hidden_dim, num_layers=3)
-        self.sl_msg = make_mlp(edge_in, hidden_dim, hidden_dim, num_layers=3)
-        self.ll_coord = make_mlp(edge_in, hidden_dim, 1, num_layers=3)
-        self.pl_coord = make_mlp(edge_in, hidden_dim, 1, num_layers=3)
-        self.sl_coord = make_mlp(edge_in, hidden_dim, 1, num_layers=3)
-        self.node_mlp = make_mlp(hidden_dim * 4, hidden_dim, hidden_dim, num_layers=2)
+        self.ll_msg = make_mlp(edge_in, hidden_dim, hidden_dim, num_layers=3, dropout=dropout)
+        self.pl_msg = make_mlp(edge_in, hidden_dim, hidden_dim, num_layers=3, dropout=dropout)
+        self.sl_msg = make_mlp(edge_in, hidden_dim, hidden_dim, num_layers=3, dropout=dropout)
+        self.ll_coord = make_mlp(edge_in, hidden_dim, 1, num_layers=3, dropout=dropout)
+        self.pl_coord = make_mlp(edge_in, hidden_dim, 1, num_layers=3, dropout=dropout)
+        self.sl_coord = make_mlp(edge_in, hidden_dim, 1, num_layers=3, dropout=dropout)
+        self.node_mlp = make_mlp(hidden_dim * 4, hidden_dim, hidden_dim, num_layers=2, dropout=dropout)
         self.coord_scale = nn.Parameter(torch.tensor(0.05))
 
     def _edge_updates(
