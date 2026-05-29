@@ -120,6 +120,7 @@ Finetune H2L from the pretraining best checkpoint:
 ```bash
 INIT_MODEL=/home/scc/pb22000262/ligand-optimization/outputs/pretrain_run/checkpoint_best.pt \
 OUTDIR=/home/scc/pb22000262/ligand-optimization/outputs/h2l_finetune_expanded \
+DATA_MANIFEST=/home/scc/pb22000262/ligand-optimization/data/processed_h2l_expanded/train/manifest.txt \
 CONFIG=configs/train_h2l_a100_1gpu_4h.yaml \
 sbatch jobs/train_h2l_a100_1gpu_4h.slurm
 ```

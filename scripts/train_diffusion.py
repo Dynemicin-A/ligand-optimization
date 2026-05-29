@@ -44,6 +44,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument(
+        "--data-manifest",
+        type=Path,
+        default=None,
+        help="Override data.manifest from the config for alternate processed datasets.",
+    )
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument(
         "--init-model",
@@ -227,6 +233,8 @@ def metric_improved(value: float, best: float | None, mode: str, min_delta: floa
 def main() -> None:
     args = parse_args()
     cfg = load_yaml(args.config)
+    if args.data_manifest is not None:
+        cfg.setdefault("data", {})["manifest"] = str(args.data_manifest)
     train_cfg = cfg.get("train", {})
     distributed, rank, local_rank, world_size = setup_distributed()
     main_process = is_main_process(rank)

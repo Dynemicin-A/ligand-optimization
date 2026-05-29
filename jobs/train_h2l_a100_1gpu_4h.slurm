@@ -24,6 +24,10 @@ INIT_ARG=()
 if [ "${INIT_MODEL:-}" != "" ]; then
   INIT_ARG=(--init-model "$INIT_MODEL")
 fi
+DATA_ARG=()
+if [ "${DATA_MANIFEST:-}" != "" ]; then
+  DATA_ARG=(--data-manifest "$DATA_MANIFEST")
+fi
 
 cd "$REPO_DIR"
 mkdir -p logs outputs
@@ -47,5 +51,6 @@ python scripts/train_diffusion.py \
   --outdir "$OUTDIR" \
   --device cuda \
   --num-workers "${NUM_WORKERS:-0}" \
+  "${DATA_ARG[@]}" \
   "${INIT_ARG[@]}" \
   "${RESUME_ARG[@]}"
