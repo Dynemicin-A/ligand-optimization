@@ -39,7 +39,19 @@ target_id / series_id, optional
 activity_low / activity_high, optional
 ```
 
-Executable preprocessing:
+Broad SBDD pretraining data is ingested with the general path-table/directory
+adapter. This is the main route for PDBbind, CrossDocked, Binding MOAD, and
+internal complex collections:
+
+```bash
+python3 scripts/preprocess_complex_dataset.py \
+  --csv data/sbdd/train_complexes.csv \
+  --outdir data/pretrain_complexes/train \
+  --source-mode self \
+  --num-workers 16
+```
+
+Executable H2L preprocessing:
 
 ```bash
 python3 scripts/preprocess_h2l.py \

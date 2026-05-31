@@ -111,21 +111,62 @@ every 1000 steps, and early stopping. It writes `checkpoint_best.pt` whenever
 
 ## Pretrain Then Finetune
 
-Prepare a pretraining CSV from PDBbind, CrossDocked, Binding MOAD, or another
-protein-ligand complex source:
+MolGenBench is not the main training source. Use it mainly for held-out H2L
+evaluation and small sanity checks. The bulk pretraining data should come from
+large protein-ligand complex sources such as PDBbind, CrossDocked, Binding MOAD,
+or internal docking/experimental complex tables.
+
+The general ingestion entry point is `scripts/preprocess_complex_dataset.py`.
+It accepts explicit CSV/TSV/JSONL path tables, which is the preferred route for
+large datasets because it avoids brittle filename assumptions:
 
 ```csv
-record_id,protein_path,ligand_path
-1abc_0,/path/1abc_pocket.pdb,/path/1abc_ligand.sdf
+record_id,protein_path,ligand_path,target_id,series_id
+1abc_0,/path/1abc_pocket.pdb,/path/1abc_ligand.sdf,1abc,pdbbind
 ```
 
-Preprocess and train the protein-ligand denoising pretrain stage:
+It also supports `source_ligand_path` and `negative_ligand_path` when the source
+is already an H2L hit or a known decoy. Without `source_ligand_path`, use
+`--source-mode self` for SBDD pretraining.
+
+Examples:
+
+```bash
+python scripts/preprocess_complex_dataset.py \
+  --csv /path/to/pretrain_complexes.csv \
+  --outdir data/pretrain_complexes/train \
+  --source-mode self \
+  --num-workers 16 \
+  --skip-existing
+
+python scripts/preprocess_complex_dataset.py \
+  --jsonl /path/to/crossdocked_split.jsonl \
+  --outdir data/crossdocked/train \
+  --source-mode self \
+  --num-workers 16
+
+python scripts/preprocess_complex_dataset.py \
+  --root /path/to/pdbbind/refined-set \
+  --preset pdbbind \
+  --outdir data/pdbbind_refined/train \
+  --source-mode self \
+  --ligands-per-protein all \
+  --num-workers 16
+```
+
+On Slurm:
 
 ```bash
 CSV=/path/to/pretrain_complexes.csv \
 OUTDIR=/home/scc/pb22000262/ligand-optimization/data/pretrain_complexes/train \
-sbatch jobs/preprocess_complex_pretrain.slurm
+NUM_WORKERS=4 \
+SOURCE_MODE=self \
+sbatch jobs/preprocess_complex_dataset.slurm
+```
 
+Train the protein-ligand denoising pretrain stage:
+
+```bash
 sbatch jobs/train_pretrain_complexes_a100_1gpu_4h.slurm
 ```
 

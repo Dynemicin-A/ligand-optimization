@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gzip
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -108,11 +110,27 @@ def normalize_element(raw: str) -> str:
 def load_first_mol(path: str | Path, sanitize: bool = True) -> Chem.Mol:
     path = Path(path)
     suffix = path.suffix.lower()
+    if suffix == ".gz":
+        inner_suffix = Path(path.stem).suffix or ".sdf"
+        handle = tempfile.NamedTemporaryFile(suffix=inner_suffix, delete=False)
+        tmp_path = Path(handle.name)
+        try:
+            with gzip.open(path, "rb") as source:
+                handle.write(source.read())
+            handle.close()
+            return load_first_mol(tmp_path, sanitize=sanitize)
+        finally:
+            handle.close()
+            tmp_path.unlink(missing_ok=True)
     if suffix in {".sdf", ".mol"}:
         supplier = Chem.SDMolSupplier(str(path), sanitize=sanitize, removeHs=False)
         for mol in supplier:
             if mol is not None:
                 return mol
+    elif suffix == ".mol2":
+        mol = Chem.MolFromMol2File(str(path), sanitize=sanitize, removeHs=False)
+        if mol is not None:
+            return mol
     elif suffix in {".smi", ".smiles", ".txt"}:
         for line in path.read_text().splitlines():
             line = line.strip()
