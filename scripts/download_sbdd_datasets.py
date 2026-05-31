@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
 import urllib.request
+from urllib.parse import quote
 from pathlib import Path
 from typing import Any
 
@@ -145,6 +146,36 @@ def run_wget(
     return subprocess.run(cmd).returncode
 
 
+def download_with_retries(
+    name: str,
+    filename: str,
+    url: str,
+    target: Path,
+    size: int | None,
+    args: argparse.Namespace,
+) -> None:
+    if is_complete(target, size):
+        log(f"{name}: skip complete {filename} ({size} bytes)")
+        return
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    for attempt in range(1, args.max_attempts + 1):
+        existing = target.stat().st_size if target.exists() else 0
+        log(f"{name}: download {filename} attempt {attempt}/{args.max_attempts}; existing={existing}")
+        rc = run_wget(url, target, args.wget_tries, args.wget_timeout, args.dry_run)
+        if args.dry_run and rc == 0:
+            log(f"{name}: dry-run complete {filename}")
+            return
+        if rc == 0 and (size is None or target.stat().st_size == size):
+            log(f"{name}: complete {filename}")
+            return
+        got = target.stat().st_size if target.exists() else 0
+        log(f"{name}: wget rc={rc}; got={got}; expected={size}; retrying after {args.retry_sleep:g}s")
+        if attempt == args.max_attempts:
+            raise RuntimeError(f"{name}: failed to download {filename}")
+        time.sleep(args.retry_sleep)
+
+
 def download_zenodo(name: str, cfg: dict[str, Any], args: argparse.Namespace) -> None:
     outdir = args.root / str(cfg["dirname"])
     archives = outdir / "archives"
@@ -169,17 +200,7 @@ def download_zenodo(name: str, cfg: dict[str, Any], args: argparse.Namespace) ->
             log(f"{name}: skip complete {filename} ({size} bytes)")
             continue
 
-        for attempt in range(1, args.max_attempts + 1):
-            existing = target.stat().st_size if target.exists() else 0
-            log(f"{name}: download {filename} attempt {attempt}/{args.max_attempts}; existing={existing}")
-            rc = run_wget(url, target, args.wget_tries, args.wget_timeout, args.dry_run)
-            if rc == 0 and (size is None or target.stat().st_size == size or args.dry_run):
-                log(f"{name}: complete {filename}")
-                break
-            log(f"{name}: wget rc={rc}; retrying {filename} after {args.retry_sleep:g}s")
-            if attempt == args.max_attempts:
-                raise RuntimeError(f"{name}: failed to download {filename}")
-            time.sleep(args.retry_sleep)
+        download_with_retries(name, filename, url, target, size, args)
 
     manifest = outdir / "archive_manifest.txt"
     with manifest.open("w", encoding="utf-8") as handle:
@@ -202,40 +223,63 @@ def download_hf(name: str, cfg: dict[str, Any], args: argparse.Namespace) -> Non
         log(f"{name}: skip because {done} exists")
         return
 
-    command = shutil.which(args.hf_command)
-    if command is None:
-        raise RuntimeError(f"HF command not found: {args.hf_command}")
-
-    cmd = [
-        command,
-        "download",
-        str(cfg["repo_id"]),
-        "--repo-type",
-        "dataset",
-        "--local-dir",
-        str(raw),
+    repo_id = str(cfg["repo_id"])
+    endpoint = args.hf_endpoint.rstrip("/")
+    tree_url = f"{endpoint}/api/datasets/{repo_id}/tree/main?recursive=1&expand=1"
+    manifest = outdir / "hf_manifest.tsv"
+    metadata_attempts = 1 if manifest.exists() else args.max_attempts
+    try:
+        tree = fetch_json(tree_url, metadata_attempts, args.retry_sleep)
+    except RuntimeError:
+        if not manifest.exists():
+            raise
+        log(f"{name}: metadata unavailable; using existing {manifest}")
+        tree = []
+        with manifest.open(encoding="utf-8") as handle:
+            next(handle, None)
+            for line in handle:
+                path, _, raw_size = line.rstrip("\n").partition("\t")
+                if not path:
+                    continue
+                tree.append({"type": "file", "path": path, "size": int(raw_size) if raw_size else None})
+    include = [str(pattern) for pattern in cfg.get("include", [])]
+    files = [
+        item
+        for item in tree
+        if item.get("type") == "file"
+        and any(fnmatch.fnmatch(str(item.get("path", "")), pattern) for pattern in include)
     ]
-    for pattern in cfg.get("include", []):
-        cmd.extend(["--include", str(pattern)])
+    files.sort(key=lambda item: str(item.get("path", "")))
+    if not files:
+        raise RuntimeError(f"{name}: no HF files matched include patterns {include}")
 
-    env = os.environ.copy()
-    env["HF_ENDPOINT"] = args.hf_endpoint
-    env.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
-    env.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    with manifest.open("w", encoding="utf-8") as handle:
+        handle.write("path\tsize_bytes\n")
+        for item in files:
+            path = str(item["path"])
+            size = expected_size(item)
+            handle.write(f"{path}\t{'' if size is None else size}\n")
 
-    for attempt in range(1, args.max_attempts + 1):
-        log(f"{name}: HF download attempt {attempt}/{args.max_attempts}; endpoint={args.hf_endpoint}")
-        log("run: " + " ".join(cmd))
-        rc = 0 if args.dry_run else subprocess.run(cmd, env=env).returncode
-        if rc == 0:
-            if not args.dry_run:
-                done.write_text(time.ctime() + "\n", encoding="utf-8")
-            log(f"{name}: finished -> {outdir}")
-            return
-        log(f"{name}: HF rc={rc}; retrying after {args.retry_sleep:g}s")
-        if attempt == args.max_attempts:
-            raise RuntimeError(f"{name}: failed after {args.max_attempts} attempts")
-        time.sleep(args.retry_sleep)
+    for item in files:
+        path = str(item["path"])
+        size = expected_size(item)
+        quoted_path = "/".join(quote(part) for part in path.split("/"))
+        url = f"{endpoint}/datasets/{repo_id}/resolve/main/{quoted_path}"
+        download_with_retries(name, path, url, raw / path, size, args)
+
+    if not args.dry_run:
+        incomplete: list[str] = []
+        for item in files:
+            path = str(item["path"])
+            size = expected_size(item)
+            if not is_complete(raw / path, size):
+                incomplete.append(path)
+        if incomplete:
+            raise RuntimeError(f"{name}: incomplete files after download: {incomplete[:10]}")
+
+    if not args.dry_run:
+        done.write_text(time.ctime() + "\n", encoding="utf-8")
+    log(f"{name}: finished -> {outdir}")
 
 
 def main() -> None:
