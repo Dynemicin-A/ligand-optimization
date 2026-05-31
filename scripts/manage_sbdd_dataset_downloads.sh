@@ -7,6 +7,7 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-50}"
 RETRY_SLEEP="${RETRY_SLEEP:-60}"
+NUM_DOWNLOADS="${NUM_DOWNLOADS:-4}"
 
 now() {
   date '+%Y-%m-%d %H:%M:%S %Z'
@@ -42,6 +43,7 @@ start_dataset() {
     --hf-endpoint "$HF_ENDPOINT" \
     --max-attempts "$MAX_ATTEMPTS" \
     --retry-sleep "$RETRY_SLEEP" \
+    --num-downloads "$NUM_DOWNLOADS" \
     > "$log" 2>&1 &
   echo "[$(now)] restarted $dataset pid=$! log=$log"
 }

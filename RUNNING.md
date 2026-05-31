@@ -121,6 +121,7 @@ Bootstrap the public sources into a named dataset root before preprocessing:
 ```bash
 DATA_ROOT=/home/zhangxuanhao/zxh/datasets \
 HF_ENDPOINT=https://hf-mirror.com \
+NUM_DOWNLOADS=4 \
 bash scripts/manage_sbdd_dataset_downloads.sh
 ```
 
@@ -128,7 +129,8 @@ The manager starts missing downloads in the background and reports status. It
 uses `scripts/download_sbdd_datasets.py` underneath, with resumable Zenodo
 downloads for PDBbind v2020 and prepared Binding MOAD, and Hugging Face download
 for CrossDocked2020. On networks where `huggingface.co` is reset, keep
-`HF_ENDPOINT=https://hf-mirror.com`.
+`HF_ENDPOINT=https://hf-mirror.com`. `NUM_DOWNLOADS=4` enables conservative
+parallel archive downloads for large Zenodo records.
 
 To run one source synchronously:
 

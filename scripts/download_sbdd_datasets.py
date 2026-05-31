@@ -9,9 +9,10 @@ import subprocess
 import sys
 import time
 import urllib.request
-from urllib.parse import quote
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 
 DATASETS: dict[str, dict[str, Any]] = {
@@ -58,6 +59,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retry-sleep", type=float, default=60.0)
     parser.add_argument("--wget-tries", type=int, default=20)
     parser.add_argument("--wget-timeout", type=int, default=60)
+    parser.add_argument(
+        "--num-downloads",
+        type=int,
+        default=int(os.environ.get("DATASET_DOWNLOAD_JOBS", "1")),
+        help="Concurrent file downloads per dataset. Use 2-4 for Zenodo archives on stable disks.",
+    )
     parser.add_argument(
         "--hf-endpoint",
         default=os.environ.get("HF_ENDPOINT", "https://hf-mirror.com"),
@@ -192,6 +199,7 @@ def download_zenodo(name: str, cfg: dict[str, Any], args: argparse.Namespace) ->
     if not files:
         raise RuntimeError(f"{name}: no files found in Zenodo record {record_id}")
 
+    pending: list[tuple[str, str, Path, int | None]] = []
     for file_entry in files:
         filename, url = zenodo_file_url(record_id, file_entry)
         target = archives / filename
@@ -199,8 +207,21 @@ def download_zenodo(name: str, cfg: dict[str, Any], args: argparse.Namespace) ->
         if is_complete(target, size):
             log(f"{name}: skip complete {filename} ({size} bytes)")
             continue
+        pending.append((filename, url, target, size))
 
-        download_with_retries(name, filename, url, target, size, args)
+    if args.num_downloads <= 1 or len(pending) <= 1:
+        for filename, url, target, size in pending:
+            download_with_retries(name, filename, url, target, size, args)
+    else:
+        workers = max(1, args.num_downloads)
+        log(f"{name}: downloading {len(pending)} files with {workers} workers")
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(download_with_retries, name, filename, url, target, size, args)
+                for filename, url, target, size in pending
+            ]
+            for future in as_completed(futures):
+                future.result()
 
     manifest = outdir / "archive_manifest.txt"
     with manifest.open("w", encoding="utf-8") as handle:
