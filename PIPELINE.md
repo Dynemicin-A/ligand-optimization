@@ -44,6 +44,10 @@ adapter. This is the main route for PDBbind, CrossDocked, Binding MOAD, and
 internal complex collections:
 
 ```bash
+DATA_ROOT=/home/zhangxuanhao/zxh/datasets \
+HF_ENDPOINT=https://hf-mirror.com \
+bash scripts/manage_sbdd_dataset_downloads.sh
+
 python3 scripts/preprocess_complex_dataset.py \
   --csv data/sbdd/train_complexes.csv \
   --outdir data/pretrain_complexes/train \

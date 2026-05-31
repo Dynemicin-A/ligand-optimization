@@ -116,6 +116,29 @@ evaluation and small sanity checks. The bulk pretraining data should come from
 large protein-ligand complex sources such as PDBbind, CrossDocked, Binding MOAD,
 or internal docking/experimental complex tables.
 
+Bootstrap the public sources into a named dataset root before preprocessing:
+
+```bash
+DATA_ROOT=/home/zhangxuanhao/zxh/datasets \
+HF_ENDPOINT=https://hf-mirror.com \
+bash scripts/manage_sbdd_dataset_downloads.sh
+```
+
+The manager starts missing downloads in the background and reports status. It
+uses `scripts/download_sbdd_datasets.py` underneath, with resumable Zenodo
+downloads for PDBbind v2020 and prepared Binding MOAD, and Hugging Face download
+for CrossDocked2020. On networks where `huggingface.co` is reset, keep
+`HF_ENDPOINT=https://hf-mirror.com`.
+
+To run one source synchronously:
+
+```bash
+python scripts/download_sbdd_datasets.py \
+  --root /home/zhangxuanhao/zxh/datasets \
+  --datasets pdbbind_v2020 \
+  --max-attempts 50
+```
+
 The general ingestion entry point is `scripts/preprocess_complex_dataset.py`.
 It accepts explicit CSV/TSV/JSONL path tables, which is the preferred route for
 large datasets because it avoids brittle filename assumptions:

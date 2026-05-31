@@ -36,3 +36,14 @@ python3 scripts/sample_diffusion.py \
 8. Evaluate chemical quality, active rediscovery, structure-based quality, and scaffold migration.
 
 See [PIPELINE.md](</Users/z/Desktop/ligand- optimization/PIPELINE.md>) for the paper-grade pipeline and [RUNNING.md](</Users/z/Desktop/ligand- optimization/RUNNING.md>) for commands.
+
+For public SBDD data bootstrapping, use:
+
+```bash
+DATA_ROOT=/home/zhangxuanhao/zxh/datasets \
+HF_ENDPOINT=https://hf-mirror.com \
+bash scripts/manage_sbdd_dataset_downloads.sh
+```
+
+This starts or resumes PDBbind v2020, prepared Binding MOAD, and CrossDocked2020
+downloads into named subdirectories under `DATA_ROOT`.
