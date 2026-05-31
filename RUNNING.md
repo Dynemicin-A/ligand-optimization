@@ -149,6 +149,29 @@ pretrain on broad SBDD complexes and finetune on non-overlapping H2L pairs, then
 point `MANIFEST` in `jobs/sample_eval_h2l_after_train.slurm` at the held-out
 MolGenBench H2L manifest for evaluation only.
 
+## 4090 Long-Run Node
+
+For unmanaged 4090 machines, use the long configs and pin one process per GPU:
+
+```bash
+python scripts/split_manifest_by_target.py \
+  --manifest data/processed_h2l_v4_expanded/train/manifest.txt \
+  --outdir data/processed_h2l_v4_expanded/split \
+  --heldout-fraction 0.2
+
+CUDA_VISIBLE_DEVICES=3 python scripts/train_diffusion.py \
+  --config configs/train_h2l_4090_long.yaml \
+  --outdir outputs/h2l_v4_4090_hn_long
+
+CUDA_VISIBLE_DEVICES=6 python scripts/train_diffusion.py \
+  --config configs/train_h2l_4090_no_hn_long.yaml \
+  --outdir outputs/h2l_v4_4090_no_hn_long
+```
+
+Both configs are deliberately budgeted for long runs (`max_steps=240000`) while
+still using EMA validation, `checkpoint_best.pt`, and early stopping after a
+minimum warmup.
+
 ## Preprocess Real H2L Triples
 
 ```bash
