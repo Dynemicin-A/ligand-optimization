@@ -246,6 +246,8 @@ def test_v3_auxiliary_losses_and_source_negative_ranking():
             hard_negative_loss_weight=0.1,
             hard_negative_score_only=True,
             hard_negative_grad_side="positive",
+            hard_negative_detach_backbone=True,
+            hard_negative_score_bound=0.5,
             distogram_loss_weight=0.1,
             contact_loss_weight=0.1,
             copy_gate_loss_weight=0.1,
@@ -273,6 +275,8 @@ def test_v3_auxiliary_losses_and_source_negative_ranking():
     assert torch.isfinite(out["hard_negative_loss"])
     assert torch.isfinite(out["score_gap"])
     assert out["hard_negative_count"].item() == 2
+    assert out["positive_score"].abs().item() <= 0.5
+    assert out["negative_score"].abs().item() <= 0.5
     out["loss"].backward()
     assert any(p.grad is not None for p in diffusion.parameters())
 
@@ -319,6 +323,72 @@ def test_partial_init_supports_added_v3_modules(tmp_path):
 
     assert "model weights" in message
     assert "loaded=" in message
+
+
+def test_task_specific_training_modes():
+    torch.manual_seed(31)
+    config = BackboneConfig(
+        hidden_dim=32,
+        time_dim=32,
+        rbf_dim=12,
+        num_blocks=1,
+        ligand_knn=3,
+        protein_knn=4,
+        cross_knn=4,
+        source_knn=3,
+        radial_basis="gaussian_cosine",
+        radial_envelope="cosine",
+        use_layer_norm=True,
+        use_residual_ffn=True,
+        edge_gate=True,
+        use_pair_trunk=True,
+        pair_dim=16,
+        pair_num_blocks=1,
+        distogram_bins=8,
+        use_copy_mutate_gate=True,
+        copy_gate_classes=5,
+    )
+    batch = {
+        "protein_atom_type": torch.randint(0, config.num_protein_atom_types, (10,)),
+        "protein_pos": torch.randn(10, 3),
+        "protein_batch": torch.tensor([0] * 5 + [1] * 5),
+        "ligand_atom_type": torch.randint(0, config.num_ligand_atom_types - 1, (7,)),
+        "ligand_pos": torch.randn(7, 3),
+        "ligand_batch": torch.tensor([0] * 3 + [1] * 4),
+        "ligand_bond_edge_index": torch.tensor([[0, 1, 3, 4], [1, 2, 4, 5]]),
+        "ligand_bond_type": torch.tensor([1, 1, 2, 1]),
+        "source_atom_type": torch.randint(0, config.num_ligand_atom_types - 1, (6,)),
+        "source_pos": torch.randn(6, 3),
+        "source_batch": torch.tensor([0] * 3 + [1] * 3),
+        "negative_ligand_atom_type": torch.randint(0, config.num_ligand_atom_types - 1, (7,)),
+        "negative_ligand_pos": torch.randn(7, 3),
+        "negative_ligand_batch": torch.tensor([0] * 3 + [1] * 4),
+        "ligand_edit_label": torch.tensor([0, 1, 2, 3, 0, 1, 2]),
+    }
+
+    for task, kwargs in {
+        "edit_policy": {"copy_gate_loss_weight": 1.0},
+        "interaction": {"distogram_loss_weight": 1.0, "contact_loss_weight": 1.0},
+        "ranking": {"hard_negative_loss_weight": 1.0, "hard_negative_detach_backbone": True, "hard_negative_score_bound": 2.0},
+    }.items():
+        diffusion = ProteinConditionedDiffusion(
+            ComplexDenoiserBackbone(config),
+            DiffusionConfig(
+                training_task=task,
+                num_timesteps=16,
+                atom_mask_token=config.num_ligand_atom_types - 1,
+                **kwargs,
+            ),
+        )
+        out = diffusion.training_loss(batch)
+        assert torch.isfinite(out["loss"])
+        if task == "edit_policy":
+            assert torch.isfinite(out["copy_gate_accuracy"])
+        if task == "interaction":
+            assert torch.isfinite(out["distogram_accuracy"])
+            assert torch.isfinite(out["contact_accuracy"])
+        if task == "ranking":
+            assert torch.isfinite(out["ranking_accuracy"])
 
 
 if __name__ == "__main__":

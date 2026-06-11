@@ -13,7 +13,7 @@ model:
   cross_knn: 96
   source_knn: 20
   cutoff: 12.0
-  dropout: 0.3
+  dropout: 0.2
   radial_basis: gaussian_cosine
   radial_envelope: cosine
   use_layer_norm: true
@@ -33,22 +33,23 @@ model:
   copy_gate_classes: 5
 
 diffusion:
+  training_task: interaction
   num_timesteps: 1000
   beta_start: 0.0001
   beta_end: 0.02
   atom_mask_token: 15
-  pos_loss_weight: 1.0
-  atom_loss_weight: 1.0
-  bond_loss_weight: 0.2
-  hard_negative_loss_weight: 0.02
+  pos_loss_weight: 0.0
+  atom_loss_weight: 0.0
+  bond_loss_weight: 0.0
+  hard_negative_loss_weight: 0.0
   hard_negative_margin: 0.2
   hard_negative_score_only: true
   hard_negative_grad_side: positive
   hard_negative_detach_backbone: true
   hard_negative_score_bound: 4.0
-  distogram_loss_weight: 0.1
-  contact_loss_weight: 0.05
-  copy_gate_loss_weight: 0.05
+  distogram_loss_weight: 1.0
+  contact_loss_weight: 1.0
+  copy_gate_loss_weight: 0.0
   copy_gate_copy_threshold: 1.25
   copy_gate_move_threshold: 3.0
 
@@ -58,13 +59,13 @@ data:
   heldout_manifest: data/processed_chembl_h2l_round6_delta05/val/manifest.txt
 
 train:
-  batch_size: 6
+  batch_size: 2
   num_workers: 4
   pin_memory: true
   drop_last: true
   valid_fraction: 0.03
-  max_steps: 120000
-  lr: 0.00001
+  max_steps: 60000
+  lr: 0.00003
   weight_decay: 0.001
   grad_clip: 1.0
   log_every: 50
@@ -77,25 +78,9 @@ train:
     validate: true
   early_stopping:
     enabled: true
-    monitor: valid_loss
+    monitor: valid_distogram_loss
     mode: min
     min_delta: 0.005
     patience: 4
     start_after: 10000
     save_best: true
-  weak_learning_stop:
-    enabled: true
-    monitor: valid_loss
-    mode: min
-    baseline_valid_loss: 1.5313
-    max_relative_gap: 0.03
-    core_monitor: valid_pos_loss
-    core_mode: min
-    core_min_delta: 0.005
-    core_max: 0.985
-    patience: 3
-    min_validations: 5
-    start_after: 10000
-    inactive_metrics:
-      - valid_hard_negative_loss
-      - valid_copy_gate_loss

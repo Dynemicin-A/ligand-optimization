@@ -23,6 +23,9 @@ class MoleculeMetrics:
     reference_rediscovery_rate: float | None = None
     reference_hit_rate: float | None = None
     reference_similarity_mean: float | None = None
+    source_similarity_mean: float | None = None
+    source_copy_rate: float | None = None
+    reference_over_source_similarity_delta: float | None = None
     scaffold_hopping_rate: float | None = None
     active_scaffold_recovery_rate: float | None = None
 
@@ -130,15 +133,27 @@ def compute_molecule_metrics(
         active_scaffold_recovery_rate = sum(scaf in ref_scaffolds for scaf in gen_scaffolds) / len(gen_scaffolds)
 
     scaffold_hopping_rate = None
+    source_similarity_mean = None
+    source_copy_rate = None
+    reference_over_source_similarity_delta = None
     if src_valid and valid_mols:
         source_scaffolds = [scaffold_smiles(mol) for mol in src_valid]
+        source_sims = []
         hop_flags = []
+        copy_flags = []
         for i, mol in enumerate(valid_mols):
             src = src_valid[min(i, len(src_valid) - 1)]
+            source_sim = tanimoto(mol, src)
+            source_sims.append(source_sim)
             same_scaffold = scaffold_smiles(mol) == source_scaffolds[min(i, len(source_scaffolds) - 1)]
-            similar_to_source = tanimoto(mol, src) >= scaffold_hopping_similarity_threshold
+            similar_to_source = source_sim >= scaffold_hopping_similarity_threshold
+            copy_flags.append(canonical_smiles(mol) == canonical_smiles(src))
             hop_flags.append((not same_scaffold) and (not similar_to_source))
+        source_similarity_mean = mean(source_sims)
+        source_copy_rate = sum(copy_flags) / len(copy_flags)
         scaffold_hopping_rate = sum(hop_flags) / len(hop_flags)
+        if reference_similarity_mean is not None:
+            reference_over_source_similarity_delta = reference_similarity_mean - source_similarity_mean
 
     return MoleculeMetrics(
         n_total=n_total,
@@ -153,6 +168,9 @@ def compute_molecule_metrics(
         reference_rediscovery_rate=reference_rediscovery_rate,
         reference_hit_rate=reference_hit_rate,
         reference_similarity_mean=reference_similarity_mean,
+        source_similarity_mean=source_similarity_mean,
+        source_copy_rate=source_copy_rate,
+        reference_over_source_similarity_delta=reference_over_source_similarity_delta,
         scaffold_hopping_rate=scaffold_hopping_rate,
         active_scaffold_recovery_rate=active_scaffold_recovery_rate,
     )

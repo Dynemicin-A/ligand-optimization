@@ -49,11 +49,14 @@ def collate_complex_records(records: list[Record]) -> Record:
     bond_edges, bond_types = [], []
     neg_types, neg_pos, neg_batch = [], [], []
     neg_bond_edges, neg_bond_types = [], []
+    ligand_edit_labels, ligand_source_match_indices = [], []
+    source_delete_labels = []
 
     ligand_offset = 0
     source_offset = 0
     negative_ligand_offset = 0
     for i, rec in enumerate(records):
+        source_start = source_offset
         n_protein = rec["protein_atom_type"].shape[0]
         n_source = rec["source_atom_type"].shape[0]
         n_ligand = rec["ligand_atom_type"].shape[0]
@@ -73,6 +76,15 @@ def collate_complex_records(records: list[Record]) -> Record:
         ligand_types.append(rec["ligand_atom_type"])
         ligand_pos.append(rec["ligand_pos"])
         ligand_batch.append(torch.full((n_ligand,), i, dtype=torch.long))
+        if "ligand_edit_label" in rec:
+            ligand_edit_labels.append(rec["ligand_edit_label"])
+        if "ligand_source_match_index" in rec:
+            match_index = rec["ligand_source_match_index"].clone()
+            valid_match = match_index >= 0
+            match_index[valid_match] += source_start
+            ligand_source_match_indices.append(match_index)
+        if "source_delete_label" in rec:
+            source_delete_labels.append(rec["source_delete_label"])
 
         edge = rec.get("ligand_bond_edge_index")
         bond_type = rec.get("ligand_bond_type")
@@ -104,6 +116,12 @@ def collate_complex_records(records: list[Record]) -> Record:
     batch["ligand_atom_type"] = torch.cat(ligand_types, dim=0)
     batch["ligand_pos"] = torch.cat(ligand_pos, dim=0)
     batch["ligand_batch"] = torch.cat(ligand_batch, dim=0)
+    if ligand_edit_labels:
+        batch["ligand_edit_label"] = torch.cat(ligand_edit_labels, dim=0)
+    if ligand_source_match_indices:
+        batch["ligand_source_match_index"] = torch.cat(ligand_source_match_indices, dim=0)
+    if source_delete_labels:
+        batch["source_delete_label"] = torch.cat(source_delete_labels, dim=0)
 
     if bond_edges:
         batch["ligand_bond_edge_index"] = torch.cat(bond_edges, dim=1)

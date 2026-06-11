@@ -26,6 +26,9 @@ OPTIONAL_TENSOR_KEYS = (
     "negative_ligand_pos",
     "negative_ligand_bond_edge_index",
     "negative_ligand_bond_type",
+    "ligand_edit_label",
+    "ligand_source_match_index",
+    "source_delete_label",
 )
 METADATA_KEYS = (
     "record_id",
@@ -183,7 +186,67 @@ def coerce_model_record(
             normalized.get("negative_ligand_bond_type"),
             "negative_ligand_bond_type",
         )
+    if "ligand_edit_label" in normalized:
+        out["ligand_edit_label"] = torch.as_tensor(normalized["ligand_edit_label"]).long().view(-1)
+        if out["ligand_edit_label"].shape[0] != out["ligand_atom_type"].shape[0]:
+            raise ValueError("ligand_edit_label must have one label per ligand atom")
+    if "ligand_source_match_index" in normalized:
+        out["ligand_source_match_index"] = torch.as_tensor(normalized["ligand_source_match_index"]).long().view(-1)
+        if out["ligand_source_match_index"].shape[0] != out["ligand_atom_type"].shape[0]:
+            raise ValueError("ligand_source_match_index must have one index per ligand atom")
+    if "source_delete_label" in normalized:
+        out["source_delete_label"] = torch.as_tensor(normalized["source_delete_label"]).long().view(-1)
+        if out["source_delete_label"].shape[0] != out["source_atom_type"].shape[0]:
+            raise ValueError("source_delete_label must have one label per source atom")
     return out
+
+
+def build_edit_labels(
+    *,
+    ligand_atom_type: torch.Tensor,
+    ligand_pos: torch.Tensor,
+    source_atom_type: torch.Tensor,
+    source_pos: torch.Tensor,
+    copy_threshold: float = 1.25,
+    move_threshold: float = 3.0,
+) -> dict[str, torch.Tensor]:
+    """Build weak target/source edit labels from nearest-neighbor geometry.
+
+    Ligand labels use the copy-gate convention:
+    0=copy, 1=mutate, 2=move, 3=grow. `source_delete_label` marks source
+    atoms that are not the nearest match of any non-grow ligand atom.
+    """
+    ligand_atom_type = torch.as_tensor(ligand_atom_type).long().view(-1)
+    ligand_pos = as_pos(ligand_pos, "ligand_pos")
+    source_atom_type = torch.as_tensor(source_atom_type).long().view(-1)
+    source_pos = as_pos(source_pos, "source_pos")
+    labels = torch.full((ligand_atom_type.shape[0],), 3, dtype=torch.long)
+    match_index = torch.full((ligand_atom_type.shape[0],), -1, dtype=torch.long)
+    source_delete = torch.ones((source_atom_type.shape[0],), dtype=torch.long)
+    if ligand_atom_type.numel() == 0 or source_atom_type.numel() == 0:
+        return {
+            "ligand_edit_label": labels,
+            "ligand_source_match_index": match_index,
+            "source_delete_label": source_delete,
+        }
+
+    dist = torch.cdist(ligand_pos, source_pos)
+    nearest_dist, nearest_source = dist.min(dim=1)
+    same_type = ligand_atom_type == source_atom_type[nearest_source]
+    copy_mask = nearest_dist <= copy_threshold
+    move_mask = (nearest_dist > copy_threshold) & (nearest_dist <= move_threshold)
+    labels[copy_mask & same_type] = 0
+    labels[copy_mask & ~same_type] = 1
+    labels[move_mask] = 2
+    matched = labels != 3
+    match_index[matched] = nearest_source[matched]
+    if matched.any():
+        source_delete[nearest_source[matched].unique()] = 0
+    return {
+        "ligand_edit_label": labels,
+        "ligand_source_match_index": match_index,
+        "source_delete_label": source_delete,
+    }
 
 def prefix_component(prefix: str, component: dict[str, Any], *, include_bonds: bool) -> dict[str, Any]:
     if "atom_type" not in component or "pos" not in component:

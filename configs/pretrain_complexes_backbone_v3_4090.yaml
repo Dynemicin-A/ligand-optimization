@@ -7,7 +7,7 @@ model:
   hidden_dim: 192
   time_dim: 64
   rbf_dim: 32
-  num_blocks: 6
+  num_blocks: 8
   ligand_knn: 20
   protein_knn: 36
   cross_knn: 96
@@ -41,8 +41,8 @@ diffusion:
   bond_loss_weight: 0.2
   hard_negative_loss_weight: 0.0
   hard_negative_margin: 0.2
-  distogram_loss_weight: 0.2
-  contact_loss_weight: 0.1
+  distogram_loss_weight: 0.05
+  contact_loss_weight: 0.05
   copy_gate_loss_weight: 0.0
 
 data:

@@ -144,6 +144,24 @@ def load_yaml(path: Path | None) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def load_sample_metrics(run_dir: Path) -> dict[str, Any] | None:
+    candidates = [
+        run_dir / "eval_metrics.json",
+        run_dir / "generated" / "eval_metrics.json",
+        run_dir / "samples" / "eval_metrics.json",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return {"path": str(path), **payload}
+    return None
+
+
 def checkpoint_steps(run_dir: Path) -> dict[int, Path]:
     found: dict[int, Path] = {}
     for path in run_dir.glob("checkpoint_step_*.pt"):
@@ -193,6 +211,7 @@ def analyze_quality(
     log_info = scan_log(log_path)
     status = infer_status(run_dir, pid, log_info)
     saved_best = select_saved_best(run_dir, rows)
+    sample_metrics = load_sample_metrics(run_dir)
 
     issues: list[str] = []
     warnings: list[str] = []
@@ -258,6 +277,7 @@ def analyze_quality(
             "nonfinite_train_steps": summary.nonfinite_train_steps[:20],
             "nonfinite_valid_steps": summary.nonfinite_valid_steps[:20],
         },
+        "sample_metrics": sample_metrics,
         "checkpoints": {
             "checkpoint_best": str(run_dir / "checkpoint_best.pt") if (run_dir / "checkpoint_best.pt").exists() else None,
             "checkpoint_last": str(run_dir / "checkpoint_last.pt") if (run_dir / "checkpoint_last.pt").exists() else None,
@@ -284,6 +304,7 @@ def analyze_improvement(
     train_loss = metric_value(last_train, "train_loss")
     atom_loss = metric_value(last_valid, "valid_atom_loss")
     pos_loss = metric_value(last_valid, "valid_pos_loss")
+    sample_metrics = quality.get("sample_metrics") or {}
 
     diagnoses: list[str] = []
     next_actions: list[str] = []
@@ -323,6 +344,22 @@ def analyze_improvement(
         diagnoses.append("atom-type loss is high; chemical identity modeling may be weak")
         next_actions.append("inspect atom vocabulary coverage and generated validity before scaling the backbone")
 
+    validity = metric_value(sample_metrics, "validity")
+    ref_delta = metric_value(sample_metrics, "reference_over_source_similarity_delta")
+    source_copy = metric_value(sample_metrics, "source_copy_rate")
+    if validity is not None and validity < 0.5:
+        diagnoses.append(f"sample validity is low ({validity:.3f}); checkpoint is not generation-ready")
+        next_actions.append("fix sampling/reconstruction before interpreting H2L improvement")
+    if source_copy is not None and source_copy > 0.5:
+        diagnoses.append(f"samples often copy the source exactly ({source_copy:.3f})")
+        next_actions.append("increase edit/grow supervision or sampling diversity before ranking alignment")
+    if ref_delta is not None:
+        if ref_delta > 0:
+            diagnoses.append(f"samples are closer to target than source by {ref_delta:.3f} Tanimoto on average")
+        else:
+            diagnoses.append(f"samples are not closer to target than source (delta {ref_delta:.3f})")
+            next_actions.append("do not promote without edit-policy or preference improvements")
+
     if not diagnoses:
         diagnoses.append("no obvious failure mode from metrics/logs")
         next_actions.append("keep as candidate and compare by downstream H2L generation/evaluation")
@@ -359,6 +396,9 @@ def write_markdown(path: Path, title: str, payload: dict[str, Any]) -> None:
         lines.append(f"- Best valid: step `{best.get('step')}`, loss `{best.get('valid_loss')}`")
         lines.append(f"- Last valid: step `{last.get('step')}`, loss `{last.get('valid_loss')}`")
         lines.append(f"- Saved best: `{metrics.get('saved_best')}`")
+        sample_metrics = payload.get("sample_metrics")
+        if sample_metrics:
+            lines.append(f"- Sample metrics: `{sample_metrics}`")
         lines.append("")
         lines.append("## Issues")
         for item in payload.get("issues", []) or ["none"]:

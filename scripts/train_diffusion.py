@@ -44,6 +44,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None, help="Override train.lr from the config.")
+    parser.add_argument("--dropout", type=float, default=None, help="Override model.dropout from the config.")
+    parser.add_argument("--disable-early-stopping", action="store_true")
+    parser.add_argument("--disable-weak-learning-stop", action="store_true")
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=None,
+        help="Accumulate this many micro-batches per optimizer step.",
+    )
     parser.add_argument(
         "--data-manifest",
         type=Path,
@@ -244,7 +254,16 @@ def evaluate(model, loader, device: torch.device, max_batches: int) -> dict[str,
     model.eval()
     sums: dict[str, float] = {}
     count = 0
-    scalar_metrics = {"positive_score", "negative_score", "score_gap", "hard_negative_count"}
+    scalar_metrics = {
+        "positive_score",
+        "negative_score",
+        "score_gap",
+        "hard_negative_count",
+        "copy_gate_accuracy",
+        "distogram_accuracy",
+        "contact_accuracy",
+        "ranking_accuracy",
+    }
     for i, batch in enumerate(loader):
         if i >= max_batches:
             break
@@ -476,9 +495,19 @@ def main() -> None:
     require_v3_config(cfg, args.config)
     if args.data_manifest is not None:
         cfg.setdefault("data", {})["manifest"] = str(args.data_manifest)
+    if args.dropout is not None:
+        cfg.setdefault("model", {})["dropout"] = args.dropout
     train_cfg = cfg.get("train", {})
     if args.batch_size is not None:
         train_cfg["batch_size"] = args.batch_size
+    if args.lr is not None:
+        train_cfg["lr"] = args.lr
+    if args.grad_accum_steps is not None:
+        train_cfg["grad_accum_steps"] = args.grad_accum_steps
+    if args.disable_early_stopping:
+        train_cfg.setdefault("early_stopping", {})["enabled"] = False
+    if args.disable_weak_learning_stop:
+        train_cfg.setdefault("weak_learning_stop", {})["enabled"] = False
     distributed, rank, local_rank, world_size = setup_distributed()
     main_process = is_main_process(rank)
     stop_requested = {"value": False}
@@ -556,6 +585,7 @@ def main() -> None:
 
     max_steps = args.max_steps or train_cfg.get("max_steps", 1000)
     grad_clip = train_cfg.get("grad_clip", 1.0)
+    grad_accum_steps = max(1, int(train_cfg.get("grad_accum_steps", 1) or 1))
     log_every = train_cfg.get("log_every", 10)
     valid_every = train_cfg.get("valid_every", 100)
     save_every = train_cfg.get("save_every", 200)
@@ -585,6 +615,8 @@ def main() -> None:
         disable=not main_process,
     )
     epoch = start_epoch
+    accum_counter = 0
+    optimizer.zero_grad(set_to_none=True)
     while step < max_steps and not stop_requested["value"]:
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -596,11 +628,15 @@ def main() -> None:
             out = model(batch)
             loss = out["loss"]
 
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            (loss / grad_accum_steps).backward()
+            accum_counter += 1
+            if accum_counter < grad_accum_steps:
+                continue
+            accum_counter = 0
             if grad_clip is not None and grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
             if ema is not None:
                 ema.update(model)
 
@@ -619,12 +655,17 @@ def main() -> None:
                     "train_hard_negative_loss": float(out["hard_negative_loss"].detach().cpu()),
                     "train_distogram_loss": scalar_metric(out, "distogram_loss"),
                     "train_contact_loss": scalar_metric(out, "contact_loss"),
+                    "train_distogram_accuracy": scalar_metric(out, "distogram_accuracy"),
+                    "train_contact_accuracy": scalar_metric(out, "contact_accuracy"),
                     "train_copy_gate_loss": scalar_metric(out, "copy_gate_loss"),
+                    "train_copy_gate_accuracy": scalar_metric(out, "copy_gate_accuracy"),
                     "train_positive_score": scalar_metric(out, "positive_score"),
                     "train_negative_score": scalar_metric(out, "negative_score"),
                     "train_score_gap": scalar_metric(out, "score_gap"),
                     "train_hard_negative_count": scalar_metric(out, "hard_negative_count"),
+                    "train_ranking_accuracy": scalar_metric(out, "ranking_accuracy"),
                     "lr": optimizer.param_groups[0]["lr"],
+                    "grad_accum_steps": grad_accum_steps,
                 }
                 pbar.set_postfix(loss=f"{log['train_loss']:.4f}")
                 with metrics_path.open("a") as f:

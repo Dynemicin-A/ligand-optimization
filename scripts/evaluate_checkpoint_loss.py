@@ -68,7 +68,16 @@ def choose_checkpoint_state(ckpt: dict, weights: str) -> tuple[str, dict[str, to
 
 
 def scalar_dict(out: dict[str, torch.Tensor]) -> dict[str, float]:
-    scalar_metrics = {"positive_score", "negative_score", "score_gap", "hard_negative_count"}
+    scalar_metrics = {
+        "positive_score",
+        "negative_score",
+        "score_gap",
+        "hard_negative_count",
+        "copy_gate_accuracy",
+        "distogram_accuracy",
+        "contact_accuracy",
+        "ranking_accuracy",
+    }
     metrics: dict[str, float] = {}
     for key, value in out.items():
         if value.dim() == 0 and (key == "loss" or key.endswith("loss") or key in scalar_metrics):

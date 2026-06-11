@@ -40,15 +40,15 @@ diffusion:
   pos_loss_weight: 1.0
   atom_loss_weight: 1.0
   bond_loss_weight: 0.2
-  hard_negative_loss_weight: 0.02
+  hard_negative_loss_weight: 0.0
   hard_negative_margin: 0.2
   hard_negative_score_only: true
   hard_negative_grad_side: positive
   hard_negative_detach_backbone: true
   hard_negative_score_bound: 4.0
-  distogram_loss_weight: 0.1
-  contact_loss_weight: 0.05
-  copy_gate_loss_weight: 0.05
+  distogram_loss_weight: 0.0
+  contact_loss_weight: 0.0
+  copy_gate_loss_weight: 0.0
   copy_gate_copy_threshold: 1.25
   copy_gate_move_threshold: 3.0
 
@@ -58,7 +58,7 @@ data:
   heldout_manifest: data/processed_chembl_h2l_round6_delta05/val/manifest.txt
 
 train:
-  batch_size: 6
+  batch_size: 2
   num_workers: 4
   pin_memory: true
   drop_last: true

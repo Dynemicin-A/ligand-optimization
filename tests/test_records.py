@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from pco_backbone.data import PTRecordDataset, collate_complex_records
-from pco_backbone.records import build_model_record, coerce_model_record
+from pco_backbone.records import build_edit_labels, build_model_record, coerce_model_record
 
 
 def component(n_atoms: int, offset: float = 0.0):
@@ -93,3 +93,29 @@ def test_collate_offsets_source_edges_and_pt_dataset_normalizes(tmp_path):
     assert batch["source_edge_index"][:, :2].max().item() < 3
     assert batch["source_edge_index"][:, 2:].min().item() >= 3
     assert "record_id" not in batch
+
+
+def test_edit_labels_and_collate_offsets_match_indices():
+    labels_a = build_edit_labels(
+        ligand_atom_type=torch.tensor([0, 1, 2]),
+        ligand_pos=torch.tensor([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [8.0, 0.0, 0.0]]),
+        source_atom_type=torch.tensor([0, 3]),
+        source_pos=torch.tensor([[0.1, 0.0, 0.0], [3.4, 0.0, 0.0]]),
+    )
+    assert labels_a["ligand_edit_label"].tolist() == [0, 2, 3]
+    rec_a = build_model_record(protein=component(2), source=component(2), ligand=component(3))
+    rec_a.update(labels_a)
+    labels_b = build_edit_labels(
+        ligand_atom_type=torch.tensor([0]),
+        ligand_pos=torch.tensor([[0.0, 0.0, 0.0]]),
+        source_atom_type=torch.tensor([1]),
+        source_pos=torch.tensor([[0.1, 0.0, 0.0]]),
+    )
+    rec_b = build_model_record(protein=component(2), source=component(1), ligand=component(1))
+    rec_b.update(labels_b)
+
+    batch = collate_complex_records([rec_a, rec_b])
+
+    assert batch["ligand_edit_label"].tolist() == [0, 2, 3, 1]
+    assert batch["ligand_source_match_index"].tolist() == [0, 1, -1, 2]
+    assert batch["source_delete_label"].shape == (3,)

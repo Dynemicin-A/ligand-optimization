@@ -11,6 +11,7 @@ from .model import ComplexDenoiserBackbone
 
 @dataclass
 class DiffusionConfig:
+    training_task: str = "diffusion"
     num_timesteps: int = 1_000
     beta_start: float = 1e-4
     beta_end: float = 2e-2
@@ -22,6 +23,8 @@ class DiffusionConfig:
     hard_negative_margin: float = 0.2
     hard_negative_score_only: bool = True
     hard_negative_grad_side: str = "positive"
+    hard_negative_detach_backbone: bool = False
+    hard_negative_score_bound: float = 0.0
     distogram_loss_weight: float = 0.0
     contact_loss_weight: float = 0.0
     copy_gate_loss_weight: float = 0.0
@@ -118,10 +121,10 @@ class ProteinConditionedDiffusion(nn.Module):
         ligand_batch: torch.Tensor,
         n_graphs: int,
         optional_source: dict[str, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         zero = ligand_pos.new_zeros(())
         if self.config.hard_negative_loss_weight <= 0:
-            return zero, zero, zero, zero, zero
+            return zero, zero, zero, zero, zero, zero
 
         if (
             "negative_ligand_atom_type" in batch
@@ -144,7 +147,7 @@ class ProteinConditionedDiffusion(nn.Module):
             negative_batch = optional_source["source_batch"]
             negative_edge_index = optional_source.get("source_edge_index")
         else:
-            return zero, zero, zero, zero, zero
+            return zero, zero, zero, zero, zero, zero
 
         grad_side = self.config.hard_negative_grad_side
         if grad_side not in {"both", "positive", "negative"}:
@@ -168,9 +171,10 @@ class ProteinConditionedDiffusion(nn.Module):
                 time=time_zero,
                 ligand_edge_index=edge_index,
                 score_only=self.config.hard_negative_score_only,
+                detach_score_features=self.config.hard_negative_detach_backbone,
                 **optional_source,
             )
-            return out["complex_score"]
+            return self._bounded_score(out["complex_score"])
 
         if grad_side == "negative":
             with torch.no_grad():
@@ -214,8 +218,15 @@ class ProteinConditionedDiffusion(nn.Module):
         neg_score = neg_score_all[neg_graphs]
         ranking = F.relu(self.config.hard_negative_margin - pos_score + neg_score).mean()
         score_gap = (pos_score - neg_score).mean()
+        ranking_accuracy = (pos_score > neg_score).float().mean()
         hard_negative_count = ligand_pos.new_tensor(float(neg_graphs.numel()))
-        return ranking, pos_score.mean(), neg_score.mean(), score_gap, hard_negative_count
+        return ranking, pos_score.mean(), neg_score.mean(), score_gap, hard_negative_count, ranking_accuracy
+
+    def _bounded_score(self, score: torch.Tensor) -> torch.Tensor:
+        bound = self.config.hard_negative_score_bound
+        if bound <= 0:
+            return score
+        return bound * torch.tanh(score / bound)
 
     def _distogram_loss(
         self,
@@ -241,6 +252,29 @@ class ProteinConditionedDiffusion(nn.Module):
         target = torch.bucketize(dist, boundaries).clamp(max=num_bins - 1).long()
         return F.cross_entropy(logits, target)
 
+    def _distogram_accuracy(
+        self,
+        out: dict[str, torch.Tensor],
+        protein_pos: torch.Tensor,
+        ligand_pos: torch.Tensor,
+    ) -> torch.Tensor:
+        logits = out.get("distogram_logits")
+        edge_index = out.get("protein_ligand_edge_index")
+        if logits is None or edge_index is None or edge_index.numel() == 0:
+            return ligand_pos.new_zeros(())
+        src, dst = edge_index
+        dist = torch.linalg.norm(ligand_pos[dst] - protein_pos[src], dim=-1)
+        num_bins = logits.shape[-1]
+        boundaries = torch.linspace(
+            self.backbone.config.distogram_min,
+            self.backbone.config.distogram_max,
+            max(num_bins - 1, 1),
+            device=dist.device,
+            dtype=dist.dtype,
+        )
+        target = torch.bucketize(dist, boundaries).clamp(max=num_bins - 1).long()
+        return (logits.argmax(dim=-1) == target).float().mean()
+
     def _contact_loss(
         self,
         out: dict[str, torch.Tensor],
@@ -256,6 +290,21 @@ class ProteinConditionedDiffusion(nn.Module):
         dist = torch.linalg.norm(ligand_pos[dst] - protein_pos[src], dim=-1)
         target = (dist <= self.backbone.config.contact_cutoff).to(logits.dtype)
         return F.binary_cross_entropy_with_logits(logits, target)
+
+    def _contact_accuracy(
+        self,
+        out: dict[str, torch.Tensor],
+        protein_pos: torch.Tensor,
+        ligand_pos: torch.Tensor,
+    ) -> torch.Tensor:
+        logits = out.get("contact_logits")
+        edge_index = out.get("protein_ligand_edge_index")
+        if logits is None or edge_index is None or edge_index.numel() == 0:
+            return ligand_pos.new_zeros(())
+        src, dst = edge_index
+        dist = torch.linalg.norm(ligand_pos[dst] - protein_pos[src], dim=-1)
+        target = dist <= self.backbone.config.contact_cutoff
+        return ((logits.sigmoid() >= 0.5) == target).float().mean()
 
     def _copy_gate_targets(
         self,
@@ -306,27 +355,45 @@ class ProteinConditionedDiffusion(nn.Module):
         ligand_pos: torch.Tensor,
         ligand_batch: torch.Tensor,
         optional_source: dict[str, torch.Tensor],
+        targets: torch.Tensor | None = None,
     ) -> torch.Tensor:
         logits = out.get("copy_gate_logits")
         if (
             self.config.copy_gate_loss_weight <= 0
             or logits is None
-            or "source_atom_type" not in optional_source
-            or "source_pos" not in optional_source
-            or "source_batch" not in optional_source
+            or (
+                targets is None
+                and (
+                    "source_atom_type" not in optional_source
+                    or "source_pos" not in optional_source
+                    or "source_batch" not in optional_source
+                )
+            )
         ):
             return ligand_pos.new_zeros(())
 
-        targets = self._copy_gate_targets(
-            ligand_atom_type=ligand_atom_type,
-            ligand_pos=ligand_pos,
-            ligand_batch=ligand_batch,
-            source_atom_type=optional_source["source_atom_type"],
-            source_pos=optional_source["source_pos"],
-            source_batch=optional_source["source_batch"],
-            num_classes=logits.shape[-1],
-        )
+        if targets is None:
+            targets = self._copy_gate_targets(
+                ligand_atom_type=ligand_atom_type,
+                ligand_pos=ligand_pos,
+                ligand_batch=ligand_batch,
+                source_atom_type=optional_source["source_atom_type"],
+                source_pos=optional_source["source_pos"],
+                source_batch=optional_source["source_batch"],
+                num_classes=logits.shape[-1],
+            )
         return F.cross_entropy(logits, targets)
+
+    def _copy_gate_accuracy(
+        self,
+        out: dict[str, torch.Tensor],
+        targets: torch.Tensor | None,
+    ) -> torch.Tensor:
+        logits = out.get("copy_gate_logits")
+        if logits is None or targets is None or targets.numel() == 0:
+            return next(iter(out.values())).new_zeros(())
+        pred = logits.argmax(dim=-1)
+        return (pred == targets.to(pred.device)).float().mean()
 
     def training_loss(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         protein_atom_type = batch["protein_atom_type"]
@@ -378,7 +445,20 @@ class ProteinConditionedDiffusion(nn.Module):
 
         distogram_loss = self._distogram_loss(out, protein_pos, ligand_pos)
         contact_loss = self._contact_loss(out, protein_pos, ligand_pos)
-        copy_gate_loss = self._copy_gate_loss(out, ligand_atom_type, ligand_pos, ligand_batch, optional_source)
+        distogram_accuracy = self._distogram_accuracy(out, protein_pos, ligand_pos)
+        contact_accuracy = self._contact_accuracy(out, protein_pos, ligand_pos)
+        explicit_copy_targets = batch.get("ligand_edit_label")
+        if explicit_copy_targets is not None:
+            explicit_copy_targets = explicit_copy_targets.to(ligand_atom_type.device).long()
+        copy_gate_loss = self._copy_gate_loss(
+            out,
+            ligand_atom_type,
+            ligand_pos,
+            ligand_batch,
+            optional_source,
+            targets=explicit_copy_targets,
+        )
+        copy_gate_accuracy = self._copy_gate_accuracy(out, explicit_copy_targets)
 
         (
             hard_negative_loss,
@@ -386,6 +466,7 @@ class ProteinConditionedDiffusion(nn.Module):
             neg_score_mean,
             score_gap,
             hard_negative_count,
+            ranking_accuracy,
         ) = self._hard_negative_loss(
             batch=batch,
             protein_atom_type=protein_atom_type,
@@ -398,15 +479,30 @@ class ProteinConditionedDiffusion(nn.Module):
             optional_source=optional_source,
         )
 
-        total_loss = (
-            self.config.pos_loss_weight * pos_loss
-            + self.config.atom_loss_weight * atom_loss
-            + self.config.bond_loss_weight * bond_loss
-            + self.config.hard_negative_loss_weight * hard_negative_loss
-            + self.config.distogram_loss_weight * distogram_loss
-            + self.config.contact_loss_weight * contact_loss
-            + self.config.copy_gate_loss_weight * copy_gate_loss
-        )
+        task = self.config.training_task
+        if task == "diffusion":
+            total_loss = (
+                self.config.pos_loss_weight * pos_loss
+                + self.config.atom_loss_weight * atom_loss
+                + self.config.bond_loss_weight * bond_loss
+                + self.config.hard_negative_loss_weight * hard_negative_loss
+                + self.config.distogram_loss_weight * distogram_loss
+                + self.config.contact_loss_weight * contact_loss
+                + self.config.copy_gate_loss_weight * copy_gate_loss
+            )
+        elif task == "edit_policy":
+            total_loss = copy_gate_loss
+        elif task == "interaction":
+            total_loss = (
+                self.config.distogram_loss_weight * distogram_loss
+                + self.config.contact_loss_weight * contact_loss
+            )
+        elif task == "ranking":
+            total_loss = self.config.hard_negative_loss_weight * hard_negative_loss
+        else:
+            raise ValueError(f"unknown diffusion training_task: {task!r}")
+        if not total_loss.requires_grad:
+            total_loss = total_loss + out["atom_logits"].sum() * 0.0
         return {
             "loss": total_loss,
             "pos_loss": pos_loss.detach(),
@@ -415,11 +511,15 @@ class ProteinConditionedDiffusion(nn.Module):
             "hard_negative_loss": hard_negative_loss.detach(),
             "distogram_loss": distogram_loss.detach(),
             "contact_loss": contact_loss.detach(),
+            "distogram_accuracy": distogram_accuracy.detach(),
+            "contact_accuracy": contact_accuracy.detach(),
             "copy_gate_loss": copy_gate_loss.detach(),
+            "copy_gate_accuracy": copy_gate_accuracy.detach(),
             "positive_score": pos_score_mean.detach(),
             "negative_score": neg_score_mean.detach(),
             "score_gap": score_gap.detach(),
             "hard_negative_count": hard_negative_count.detach(),
+            "ranking_accuracy": ranking_accuracy.detach(),
             "time_index": graph_t.detach(),
         }
 

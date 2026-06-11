@@ -24,7 +24,7 @@ class BackboneConfig:
     hidden_dim: int = 192
     time_dim: int = 64
     rbf_dim: int = 32
-    num_blocks: int = 6
+    num_blocks: int = 8
     ligand_knn: int = 16
     protein_knn: int = 24
     cross_knn: int = 32
@@ -238,6 +238,7 @@ class ComplexDenoiserBackbone(nn.Module):
         source_batch: torch.Tensor | None = None,
         source_edge_index: torch.Tensor | None = None,
         score_only: bool = False,
+        detach_score_features: bool = False,
     ) -> dict[str, torch.Tensor]:
         if ligand_pos.shape[-1] != 3 or protein_pos.shape[-1] != 3:
             raise ValueError("positions must have shape [N, 3]")
@@ -410,6 +411,9 @@ class ComplexDenoiserBackbone(nn.Module):
 
         ligand_pool = self._graph_mean(ligand_h, ligand_batch, n_graphs)
         protein_pool = self._graph_mean(protein_h, protein_batch, n_graphs)
+        if detach_score_features:
+            ligand_pool = ligand_pool.detach()
+            protein_pool = protein_pool.detach()
         complex_score = self.global_head(torch.cat([ligand_pool, protein_pool], dim=-1)).squeeze(-1)
         if score_only:
             return {"complex_score": complex_score}
