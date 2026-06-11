@@ -86,6 +86,16 @@ def parse_args() -> argparse.Namespace:
         help="For rows without source_ligand_path: self uses target as source; optional keeps explicit source only; none is invalid for current training.",
     )
     parser.add_argument("--sanitize", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--heavy-only",
+        action="store_true",
+        help="Drop explicit hydrogens from source/target/negative ligands and from pocket atoms.",
+    )
+    parser.add_argument(
+        "--keep-protein-hydrogens",
+        action="store_true",
+        help="With --heavy-only, keep protein/pocket hydrogens while still dropping ligand hydrogens.",
+    )
     parser.add_argument("--limit-dirs", type=int, default=None, help="Directory discovery cap for quick smoke tests.")
     parser.add_argument(
         "--allow-protein-like-ligands",
@@ -314,7 +324,15 @@ def deduplicate_record_ids(rows: list[InputRow]) -> list[InputRow]:
     return out
 
 
-def build_record(row: InputRow, outdir: Path, pocket_radius: float, sanitize: bool, skip_existing: bool):
+def build_record(
+    row: InputRow,
+    outdir: Path,
+    pocket_radius: float,
+    sanitize: bool,
+    skip_existing: bool,
+    heavy_only: bool,
+    keep_protein_hydrogens: bool,
+):
     out_path = outdir / f"{row.record_id}.pt"
     if skip_existing and out_path.exists():
         return "written", {"record_id": row.record_id, "path": str(out_path.resolve()), "skipped": "1"}, None
@@ -322,11 +340,13 @@ def build_record(row: InputRow, outdir: Path, pocket_radius: float, sanitize: bo
     if row.source_ligand_path is None:
         raise ValueError("source_ligand_path is required; use --source-mode self for pretraining datasets")
 
-    protein_full = parse_pdb_atoms(row.protein_path)
+    include_ligand_hydrogens = not heavy_only
+    include_protein_hydrogens = (not heavy_only) or keep_protein_hydrogens
+    protein_full = parse_pdb_atoms(row.protein_path, include_hydrogens=include_protein_hydrogens)
     source_mol = load_first_mol(row.source_ligand_path, sanitize=sanitize)
     target_mol = load_first_mol(row.target_ligand_path, sanitize=sanitize)
-    source = mol_to_record_tensors(source_mol)
-    target = mol_to_record_tensors(target_mol)
+    source = mol_to_record_tensors(source_mol, include_hydrogens=include_ligand_hydrogens)
+    target = mol_to_record_tensors(target_mol, include_hydrogens=include_ligand_hydrogens)
     protein = crop_protein_to_ligand(protein_full, source["pos"], pocket_radius)
     metadata = {
         "record_id": row.record_id,
@@ -335,11 +355,12 @@ def build_record(row: InputRow, outdir: Path, pocket_radius: float, sanitize: bo
         "protein_path": str(row.protein_path.resolve()),
         "source_ligand_path": str(row.source_ligand_path.resolve()),
         "target_ligand_path": str(row.target_ligand_path.resolve()),
+        "hydrogen_policy": "heavy_only" if heavy_only else "explicit_hydrogens",
     }
     negative = None
     if row.negative_ligand_path is not None:
         negative_mol = load_first_mol(row.negative_ligand_path, sanitize=sanitize)
-        negative = mol_to_record_tensors(negative_mol)
+        negative = mol_to_record_tensors(negative_mol, include_hydrogens=include_ligand_hydrogens)
         metadata["negative_ligand_path"] = str(row.negative_ligand_path.resolve())
     record = build_model_record(
         protein=protein,
@@ -369,9 +390,9 @@ def build_record(row: InputRow, outdir: Path, pocket_radius: float, sanitize: bo
 
 
 def worker(payload):
-    row, outdir, pocket_radius, sanitize, skip_existing = payload
+    row, outdir, pocket_radius, sanitize, skip_existing, heavy_only, keep_protein_hydrogens = payload
     try:
-        return build_record(row, outdir, pocket_radius, sanitize, skip_existing)
+        return build_record(row, outdir, pocket_radius, sanitize, skip_existing, heavy_only, keep_protein_hydrogens)
     except Exception as exc:
         return (
             "failure",
@@ -413,7 +434,18 @@ def main() -> None:
     manifest_paths: list[str] = []
     written_rows: list[dict[str, str]] = []
     failure_rows: list[dict[str, str]] = []
-    payloads = [(row, args.outdir, args.pocket_radius, args.sanitize, args.skip_existing) for row in rows]
+    payloads = [
+        (
+            row,
+            args.outdir,
+            args.pocket_radius,
+            args.sanitize,
+            args.skip_existing,
+            args.heavy_only,
+            args.keep_protein_hydrogens,
+        )
+        for row in rows
+    ]
 
     if args.num_workers <= 1:
         iterator = (worker(payload) for payload in payloads)
@@ -465,6 +497,7 @@ def main() -> None:
     print(f"input_rows: {len(rows)}")
     print(f"wrote_records: {len(written_rows)}")
     print(f"failures: {len(failure_rows)}")
+    print(f"heavy_only: {args.heavy_only}")
     print(f"manifest: {manifest}")
     print(f"records_csv: {args.outdir / args.records_name}")
     print(f"failures_csv: {args.outdir / args.failures_name}")

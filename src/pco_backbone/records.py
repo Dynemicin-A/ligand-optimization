@@ -56,6 +56,7 @@ METADATA_KEYS = (
     "negative_affinity_type",
     "negative_affinity_unit",
     "negative_similarity_to_target",
+    "hydrogen_policy",
 )
 
 

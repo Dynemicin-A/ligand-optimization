@@ -19,6 +19,8 @@ def passthrough_parser() -> argparse.ArgumentParser:
     for name, help_text in [
         ("preprocess", "Preprocess generic protein-ligand CSV/JSONL/root datasets into canonical v3 records."),
         ("preprocess-molgenbench-h2l", "Preprocess MolGenBench v3 H2L series into canonical v3 records."),
+        ("build-chembl-h2l-pairs", "Build filtered ChEMBL low-to-high H2L pair CSVs."),
+        ("build-h2l-edit-labels", "Build source-target copy/mutate/move/grow edit labels."),
         ("train-pretrain", "Train v3 PDBbind/SBDD pretraining config."),
         ("train-h2l", "Train v3 ChEMBL/H2L finetuning config."),
         ("eval-loss", "Evaluate a v3 checkpoint on the configured validation split."),
@@ -61,6 +63,10 @@ def main() -> None:
         raise SystemExit(run_script("preprocess_complex_dataset.py", parsed.args))
     if parsed.command == "preprocess-molgenbench-h2l":
         raise SystemExit(run_script("preprocess_molgenbench_h2l.py", parsed.args))
+    if parsed.command == "build-chembl-h2l-pairs":
+        raise SystemExit(run_script("build_chembl_h2l_pairs.py", parsed.args))
+    if parsed.command == "build-h2l-edit-labels":
+        raise SystemExit(run_script("build_h2l_edit_labels.py", parsed.args))
     if parsed.command == "train-pretrain":
         raise SystemExit(
             run_train(

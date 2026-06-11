@@ -66,6 +66,7 @@ RDKIT_BOND_TO_TYPE = {
     Chem.BondType.TRIPLE: 3,
     Chem.BondType.AROMATIC: 4,
 }
+HYDROGEN_SYMBOLS = {"H", "D", "T"}
 
 
 @dataclass(frozen=True)
@@ -107,6 +108,10 @@ def normalize_element(raw: str) -> str:
     return raw[0].upper() + raw[1:].lower()
 
 
+def is_hydrogen_symbol(raw: str) -> bool:
+    return normalize_element(raw) in HYDROGEN_SYMBOLS
+
+
 def load_first_mol(path: str | Path, sanitize: bool = True) -> Chem.Mol:
     path = Path(path)
     suffix = path.suffix.lower()
@@ -145,23 +150,39 @@ def load_first_mol(path: str | Path, sanitize: bool = True) -> Chem.Mol:
     raise ValueError(f"could not load molecule from {path}")
 
 
-def mol_to_record_tensors(mol: Chem.Mol, vocab: AtomVocab | None = None) -> dict[str, torch.Tensor]:
+def mol_to_record_tensors(
+    mol: Chem.Mol,
+    vocab: AtomVocab | None = None,
+    *,
+    include_hydrogens: bool = True,
+) -> dict[str, torch.Tensor]:
     vocab = vocab or AtomVocab.ligand_default()
     conf = mol.GetConformer() if mol.GetNumConformers() else None
     atom_type = []
     pos = []
-    for atom in mol.GetAtoms():
+    kept_atom_indices = [
+        atom.GetIdx()
+        for atom in mol.GetAtoms()
+        if include_hydrogens or not is_hydrogen_symbol(atom.GetSymbol())
+    ]
+    atom_index_map = {old_idx: new_idx for new_idx, old_idx in enumerate(kept_atom_indices)}
+    for old_idx in kept_atom_indices:
+        atom = mol.GetAtomWithIdx(old_idx)
         atom_type.append(vocab.encode(atom.GetSymbol()))
         if conf is None:
             pos.append([0.0, 0.0, 0.0])
         else:
-            p = conf.GetAtomPosition(atom.GetIdx())
+            p = conf.GetAtomPosition(old_idx)
             pos.append([p.x, p.y, p.z])
 
     bond_edges = []
     bond_types = []
     for bond in mol.GetBonds():
-        bond_edges.append([bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()])
+        begin = bond.GetBeginAtomIdx()
+        end = bond.GetEndAtomIdx()
+        if begin not in atom_index_map or end not in atom_index_map:
+            continue
+        bond_edges.append([atom_index_map[begin], atom_index_map[end]])
         bond_types.append(RDKIT_BOND_TO_TYPE.get(bond.GetBondType(), 1))
 
     return {
@@ -176,7 +197,12 @@ def mol_to_record_tensors(mol: Chem.Mol, vocab: AtomVocab | None = None) -> dict
     }
 
 
-def parse_pdb_atoms(path: str | Path, vocab: AtomVocab | None = None) -> dict[str, torch.Tensor]:
+def parse_pdb_atoms(
+    path: str | Path,
+    vocab: AtomVocab | None = None,
+    *,
+    include_hydrogens: bool = True,
+) -> dict[str, torch.Tensor]:
     vocab = vocab or AtomVocab.protein_default()
     atom_type = []
     pos = []
@@ -193,6 +219,8 @@ def parse_pdb_atoms(path: str | Path, vocab: AtomVocab | None = None) -> dict[st
             element = line[76:78].strip() if len(line) >= 78 else ""
             if not element:
                 element = line[12:16].strip()
+            if not include_hydrogens and is_hydrogen_symbol(element):
+                continue
             atom_type.append(vocab.encode(element))
             pos.append([x, y, z])
     if not atom_type:

@@ -69,6 +69,45 @@ def test_csv_preprocess_complex_dataset(tmp_path):
     assert record["protein_atom_type"].numel() > 0
 
 
+def test_csv_preprocess_heavy_only_drops_ligand_hydrogens(tmp_path):
+    protein = tmp_path / "protein.pdb"
+    source = tmp_path / "source.sdf"
+    target = tmp_path / "target.sdf"
+    negative = tmp_path / "negative.sdf"
+    write_pdb(protein)
+    write_sdf(source, "CCO")
+    write_sdf(target, "CCCO")
+    write_sdf(negative, "CCN")
+    table = tmp_path / "complexes.csv"
+    with table.open("w", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["record_id", "protein_path", "source_ligand_path", "target_ligand_path", "negative_ligand_path"],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "record_id": "toy_heavy",
+                "protein_path": protein.name,
+                "source_ligand_path": source.name,
+                "target_ligand_path": target.name,
+                "negative_ligand_path": negative.name,
+            }
+        )
+
+    outdir = tmp_path / "out_heavy"
+    run_preprocess("--csv", str(table), "--outdir", str(outdir), "--num-workers", "1", "--heavy-only")
+    path = Path((outdir / "manifest.txt").read_text().strip())
+    record = torch.load(path, map_location="cpu", weights_only=False)
+
+    assert record["source_atom_type"].numel() == 3
+    assert record["ligand_atom_type"].numel() == 4
+    assert record["negative_ligand_atom_type"].numel() == 3
+    assert 12 not in record["source_atom_type"].tolist()
+    assert 12 not in record["ligand_atom_type"].tolist()
+    assert record["hydrogen_policy"] == "heavy_only"
+
+
 def test_directory_preprocess_multiple_ligands(tmp_path):
     complex_dir = tmp_path / "target_a" / "complex_001"
     complex_dir.mkdir(parents=True)
