@@ -23,6 +23,7 @@ def passthrough_parser() -> argparse.ArgumentParser:
         ("build-h2l-edit-labels", "Build source-target copy/mutate/move/grow edit labels."),
         ("train-pretrain", "Train v3 PDBbind/SBDD pretraining config."),
         ("train-h2l", "Train v3 ChEMBL/H2L finetuning config."),
+        ("train-h2l-flow", "Train v3 ChEMBL/H2L source-anchored flow-matching config."),
         ("eval-loss", "Evaluate a v3 checkpoint on the configured validation split."),
         ("sample-h2l", "Sample H2L ligands from a v3 checkpoint and manifest."),
         ("review", "Run post-run quality and improvement review."),
@@ -80,6 +81,14 @@ def main() -> None:
             run_train(
                 "configs/train_h2l_chembl_backbone_v3_4090.yaml",
                 "outputs/v3_h2l",
+                parsed.args,
+            )
+        )
+    if parsed.command == "train-h2l-flow":
+        raise SystemExit(
+            run_train(
+                "configs/train_h2l_chembl_backbone_v3_flow_matching_4090.yaml",
+                "outputs/v3_h2l_flow_matching",
                 parsed.args,
             )
         )

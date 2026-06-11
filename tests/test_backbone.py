@@ -281,6 +281,67 @@ def test_v3_auxiliary_losses_and_source_negative_ranking():
     assert any(p.grad is not None for p in diffusion.parameters())
 
 
+def test_source_anchored_flow_matching_training_loss():
+    torch.manual_seed(37)
+    config = BackboneConfig(
+        hidden_dim=40,
+        time_dim=32,
+        rbf_dim=16,
+        num_blocks=1,
+        ligand_knn=4,
+        protein_knn=5,
+        cross_knn=6,
+        source_knn=4,
+        radial_basis="gaussian_cosine",
+        radial_envelope="cosine",
+        use_layer_norm=True,
+        use_residual_ffn=True,
+        edge_gate=True,
+        use_pair_trunk=True,
+        pair_dim=20,
+        pair_num_blocks=1,
+        distogram_bins=10,
+        use_copy_mutate_gate=True,
+        copy_gate_classes=5,
+    )
+    diffusion = ProteinConditionedDiffusion(
+        ComplexDenoiserBackbone(config),
+        DiffusionConfig(
+            position_objective="flow_matching",
+            flow_matching_base="source",
+            flow_matching_noise_scale=0.1,
+            atom_mask_token=config.num_ligand_atom_types - 1,
+            distogram_loss_weight=0.1,
+            contact_loss_weight=0.1,
+            copy_gate_loss_weight=0.1,
+        ),
+    )
+    batch = {
+        "protein_atom_type": torch.randint(0, config.num_protein_atom_types, (10,)),
+        "protein_pos": torch.randn(10, 3),
+        "protein_batch": torch.tensor([0] * 5 + [1] * 5),
+        "ligand_atom_type": torch.randint(0, config.num_ligand_atom_types - 1, (7,)),
+        "ligand_pos": torch.randn(7, 3),
+        "ligand_batch": torch.tensor([0] * 3 + [1] * 4),
+        "ligand_bond_edge_index": torch.tensor([[0, 1, 3, 4], [1, 2, 4, 5]]),
+        "ligand_bond_type": torch.tensor([1, 1, 2, 1]),
+        "source_atom_type": torch.randint(0, config.num_ligand_atom_types - 1, (6,)),
+        "source_pos": torch.randn(6, 3),
+        "source_batch": torch.tensor([0] * 3 + [1] * 3),
+        "source_edge_index": torch.tensor([[0, 1, 3, 4], [1, 2, 4, 5]]),
+        "ligand_edit_label": torch.tensor([0, 1, 2, 3, 0, 1, 2]),
+        "ligand_source_match_index": torch.tensor([0, 1, 2, -1, 3, 4, -1]),
+    }
+
+    out = diffusion.training_loss(batch)
+    assert torch.isfinite(out["loss"])
+    assert torch.isfinite(out["pos_loss"])
+    assert torch.isfinite(out["copy_gate_loss"])
+    assert out["time_index"].dtype.is_floating_point
+    out["loss"].backward()
+    assert any(p.grad is not None for p in diffusion.parameters())
+
+
 def test_partial_init_supports_added_v3_modules(tmp_path):
     torch.manual_seed(23)
     base_config = BackboneConfig(

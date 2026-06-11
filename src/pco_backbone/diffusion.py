@@ -12,10 +12,14 @@ from .model import ComplexDenoiserBackbone
 @dataclass
 class DiffusionConfig:
     training_task: str = "diffusion"
+    position_objective: str = "diffusion"
     num_timesteps: int = 1_000
     beta_start: float = 1e-4
     beta_end: float = 2e-2
     atom_mask_token: int | None = None
+    flow_matching_base: str = "gaussian"
+    flow_matching_time_epsilon: float = 1e-4
+    flow_matching_noise_scale: float = 1.0
     pos_loss_weight: float = 1.0
     atom_loss_weight: float = 1.0
     bond_loss_weight: float = 0.2
@@ -76,10 +80,80 @@ class ProteinConditionedDiffusion(nn.Module):
         ligand_batch: torch.Tensor,
     ) -> torch.Tensor:
         mask_prob = (graph_t.float() / max(self.config.num_timesteps - 1, 1))[ligand_batch]
+        return self._mask_atom_type(clean_atom_type, mask_prob)
+
+    def _mask_atom_type(self, clean_atom_type: torch.Tensor, mask_prob: torch.Tensor) -> torch.Tensor:
         should_mask = torch.rand_like(mask_prob) < mask_prob
         noisy = clean_atom_type.clone()
         noisy[should_mask] = self.atom_mask_token
         return noisy
+
+    def sample_flow_times(self, n_graphs: int, device: torch.device) -> torch.Tensor:
+        eps = max(0.0, min(float(self.config.flow_matching_time_epsilon), 0.49))
+        if eps == 0.0:
+            return torch.rand((n_graphs,), device=device)
+        return torch.rand((n_graphs,), device=device) * (1.0 - 2.0 * eps) + eps
+
+    def _source_anchored_base_pos(
+        self,
+        batch: dict[str, torch.Tensor],
+        ligand_pos: torch.Tensor,
+        ligand_batch: torch.Tensor,
+        optional_source: dict[str, torch.Tensor],
+    ) -> torch.Tensor | None:
+        source_pos = optional_source.get("source_pos")
+        source_batch = optional_source.get("source_batch")
+        match_index = batch.get("ligand_source_match_index")
+        if source_pos is None or source_batch is None or source_pos.numel() == 0 or match_index is None:
+            return None
+
+        base = torch.randn_like(ligand_pos) * float(self.config.flow_matching_noise_scale)
+        match_index = match_index.to(ligand_pos.device).long()
+        valid = (match_index >= 0) & (match_index < source_pos.shape[0])
+        if valid.any():
+            base[valid] = source_pos[match_index[valid]]
+
+        unmatched = ~valid
+        if unmatched.any():
+            n_graphs = int(max(source_batch.max(), ligand_batch.max()).item()) + 1
+            centroids = ligand_pos.new_zeros((n_graphs, 3))
+            counts = ligand_pos.new_zeros((n_graphs, 1))
+            centroids.index_add_(0, source_batch, source_pos)
+            counts.index_add_(0, source_batch, ligand_pos.new_ones((source_pos.shape[0], 1)))
+            centroids = centroids / counts.clamp_min(1.0)
+            base[unmatched] = (
+                centroids[ligand_batch[unmatched]]
+                + torch.randn_like(base[unmatched]) * float(self.config.flow_matching_noise_scale)
+            )
+        return base
+
+    def q_flow_match_pos(
+        self,
+        clean_pos: torch.Tensor,
+        graph_time: torch.Tensor,
+        ligand_batch: torch.Tensor,
+        *,
+        batch: dict[str, torch.Tensor],
+        optional_source: dict[str, torch.Tensor],
+        noise: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        base = None
+        if self.config.flow_matching_base == "source":
+            base = self._source_anchored_base_pos(batch, clean_pos, ligand_batch, optional_source)
+        elif self.config.flow_matching_base != "gaussian":
+            raise ValueError(
+                "flow_matching_base must be one of: gaussian, source; "
+                f"got {self.config.flow_matching_base!r}"
+            )
+        if base is None:
+            if noise is None:
+                noise = torch.randn_like(clean_pos)
+            base = noise * float(self.config.flow_matching_noise_scale)
+
+        t = graph_time[ligand_batch].view(-1, 1)
+        flow_pos = (1.0 - t) * base + t * clean_pos
+        velocity = clean_pos - base
+        return flow_pos, velocity, base
 
     @staticmethod
     def _num_graphs(protein_batch: torch.Tensor, ligand_batch: torch.Tensor) -> int:
@@ -404,18 +478,40 @@ class ProteinConditionedDiffusion(nn.Module):
         ligand_batch = batch["ligand_batch"]
 
         n_graphs = self._num_graphs(protein_batch, ligand_batch)
-        graph_t = batch.get("time_index")
-        if graph_t is None:
-            graph_t = self.sample_timesteps(n_graphs, ligand_pos.device)
-        time = graph_t.float() / max(self.config.num_timesteps - 1, 1)
-
-        noisy_pos, pos_noise = self.q_sample_pos(ligand_pos, graph_t, ligand_batch)
-        noisy_atom_type = self.q_sample_atom_type(ligand_atom_type, graph_t, ligand_batch)
-
         optional_source = {}
         for key in ["source_atom_type", "source_pos", "source_batch", "source_edge_index"]:
             if key in batch:
                 optional_source[key] = batch[key]
+
+        position_objective = self.config.position_objective
+        graph_t = batch.get("time_index")
+        if position_objective == "diffusion":
+            if graph_t is None:
+                graph_t = self.sample_timesteps(n_graphs, ligand_pos.device)
+            time = graph_t.float() / max(self.config.num_timesteps - 1, 1)
+            noisy_pos, pos_target = self.q_sample_pos(ligand_pos, graph_t, ligand_batch)
+            noisy_atom_type = self.q_sample_atom_type(ligand_atom_type, graph_t, ligand_batch)
+        elif position_objective == "flow_matching":
+            if graph_t is None:
+                time = self.sample_flow_times(n_graphs, ligand_pos.device)
+            else:
+                time = graph_t.float()
+                if time.max() > 1.0:
+                    time = time / max(self.config.num_timesteps - 1, 1)
+                time = time.clamp(0.0, 1.0)
+            noisy_pos, pos_target, _ = self.q_flow_match_pos(
+                ligand_pos,
+                time,
+                ligand_batch,
+                batch=batch,
+                optional_source=optional_source,
+            )
+            noisy_atom_type = self._mask_atom_type(ligand_atom_type, 1.0 - time[ligand_batch])
+        else:
+            raise ValueError(
+                "position_objective must be one of: diffusion, flow_matching; "
+                f"got {position_objective!r}"
+            )
 
         out = self.backbone(
             protein_atom_type=protein_atom_type,
@@ -429,7 +525,7 @@ class ProteinConditionedDiffusion(nn.Module):
             **optional_source,
         )
 
-        pos_loss = F.mse_loss(out["pos_update"], pos_noise)
+        pos_loss = F.mse_loss(out["pos_update"], pos_target)
         atom_loss = F.cross_entropy(out["atom_logits"], ligand_atom_type)
 
         bond_target = self._bond_targets_for_edges(
@@ -520,7 +616,7 @@ class ProteinConditionedDiffusion(nn.Module):
             "score_gap": score_gap.detach(),
             "hard_negative_count": hard_negative_count.detach(),
             "ranking_accuracy": ranking_accuracy.detach(),
-            "time_index": graph_t.detach(),
+            "time_index": graph_t.detach() if graph_t is not None else time.detach(),
         }
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -556,6 +652,22 @@ class ProteinConditionedDiffusion(nn.Module):
 
         n_graphs = self._num_graphs(protein_batch, ligand_batch)
         steps = num_steps or self.config.num_timesteps
+        optional_source = {}
+        for key in ["source_atom_type", "source_pos", "source_batch", "source_edge_index"]:
+            if key in batch:
+                optional_source[key] = batch[key]
+
+        if self.config.position_objective == "flow_matching":
+            return self._sample_flow_matching(
+                batch,
+                n_graphs=n_graphs,
+                ligand_batch=ligand_batch,
+                ligand_pos=ligand_pos,
+                ligand_atom_type=ligand_atom_type,
+                steps=steps,
+                temperature=temperature,
+                optional_source=optional_source,
+            )
         step_indices = torch.linspace(
             self.config.num_timesteps - 1,
             0,
@@ -564,11 +676,6 @@ class ProteinConditionedDiffusion(nn.Module):
         ).long()
         x_t = torch.randn_like(ligand_pos) * temperature
         atom_t = ligand_atom_type.clone()
-
-        optional_source = {}
-        for key in ["source_atom_type", "source_pos", "source_batch", "source_edge_index"]:
-            if key in batch:
-                optional_source[key] = batch[key]
 
         last_out = None
         for t_scalar in step_indices:
@@ -596,6 +703,55 @@ class ProteinConditionedDiffusion(nn.Module):
                 x_t = mean + beta_t.sqrt() * noise
             else:
                 x_t = mean
+            atom_t = last_out["atom_logits"].argmax(dim=-1)
+
+        assert last_out is not None
+        return {
+            "ligand_pos": x_t,
+            "ligand_atom_type": atom_t,
+            "bond_edge_index": last_out["bond_edge_index"],
+            "bond_type": last_out["bond_logits"].argmax(dim=-1),
+            "atom_logits": last_out["atom_logits"],
+            "bond_logits": last_out["bond_logits"],
+        }
+
+    def _sample_flow_matching(
+        self,
+        batch: dict[str, torch.Tensor],
+        *,
+        n_graphs: int,
+        ligand_batch: torch.Tensor,
+        ligand_pos: torch.Tensor,
+        ligand_atom_type: torch.Tensor,
+        steps: int,
+        temperature: float,
+        optional_source: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        steps = max(int(steps), 1)
+        if self.config.flow_matching_base == "source":
+            base = self._source_anchored_base_pos(batch, ligand_pos, ligand_batch, optional_source)
+        else:
+            base = None
+        if base is None:
+            base = torch.randn_like(ligand_pos) * temperature * float(self.config.flow_matching_noise_scale)
+        x_t = base
+        atom_t = ligand_atom_type.clone()
+        last_out = None
+        dt = 1.0 / steps
+        for i in range(steps):
+            time = torch.full((n_graphs,), i / steps, dtype=ligand_pos.dtype, device=ligand_pos.device)
+            last_out = self.backbone(
+                protein_atom_type=batch["protein_atom_type"],
+                protein_pos=batch["protein_pos"],
+                protein_batch=batch["protein_batch"],
+                ligand_atom_type=atom_t,
+                ligand_pos=x_t,
+                ligand_batch=ligand_batch,
+                time=time,
+                ligand_edge_index=batch.get("ligand_edge_index"),
+                **optional_source,
+            )
+            x_t = x_t + dt * last_out["pos_update"]
             atom_t = last_out["atom_logits"].argmax(dim=-1)
 
         assert last_out is not None
