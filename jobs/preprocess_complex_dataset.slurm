@@ -50,7 +50,7 @@ mkdir -p logs "$OUTDIR"
 source /home/scc/pb22000262/miniconda3/etc/profile.d/conda.sh
 conda activate dataset-agent
 
-python scripts/preprocess_complex_dataset.py \
+python scripts/ligopt_v3.py preprocess -- \
   "${INPUT_ARGS[@]}" \
   --outdir "$OUTDIR" \
   --pocket-radius "${POCKET_RADIUS:-10.0}" \

@@ -4,6 +4,7 @@ from pathlib import Path
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
 from pco_backbone import (
@@ -12,6 +13,7 @@ from pco_backbone import (
     DiffusionConfig,
     ProteinConditionedDiffusion,
 )
+from scripts.train_diffusion import load_model_weights
 
 
 def test_forward_shapes():
@@ -108,6 +110,215 @@ def test_diffusion_training_loss():
     assert torch.isfinite(out["hard_negative_loss"])
     out["loss"].backward()
     assert any(p.grad is not None for p in diffusion.parameters())
+
+
+def test_forward_with_v3_residual_radial_modules():
+    torch.manual_seed(17)
+    config = BackboneConfig(
+        hidden_dim=48,
+        time_dim=32,
+        rbf_dim=18,
+        num_blocks=2,
+        ligand_knn=4,
+        protein_knn=6,
+        cross_knn=8,
+        source_knn=4,
+        radial_basis="gaussian_cosine",
+        radial_envelope="cosine",
+        use_layer_norm=True,
+        use_residual_ffn=True,
+        ffn_multiplier=2,
+        edge_gate=True,
+        layer_scale_init=0.1,
+    )
+    model = ComplexDenoiserBackbone(config)
+
+    out = model(
+        protein_atom_type=torch.randint(0, config.num_protein_atom_types, (14,)),
+        protein_pos=torch.randn(14, 3),
+        protein_batch=torch.tensor([0] * 6 + [1] * 8),
+        ligand_atom_type=torch.randint(0, config.num_ligand_atom_types, (9,)),
+        ligand_pos=torch.randn(9, 3),
+        ligand_batch=torch.tensor([0] * 4 + [1] * 5),
+        time=torch.tensor([0.1, 0.7]),
+        source_atom_type=torch.randint(0, config.num_ligand_atom_types, (8,)),
+        source_pos=torch.randn(8, 3),
+        source_batch=torch.tensor([0] * 3 + [1] * 5),
+    )
+
+    assert out["pos_update"].shape == (9, 3)
+    assert out["atom_logits"].shape == (9, config.num_ligand_atom_types)
+    assert torch.isfinite(out["pos_update"]).all()
+    assert torch.isfinite(out["atom_logits"]).all()
+
+
+def test_forward_with_v3_pair_trunk_outputs():
+    torch.manual_seed(19)
+    config = BackboneConfig(
+        hidden_dim=48,
+        time_dim=32,
+        rbf_dim=16,
+        num_blocks=1,
+        ligand_knn=4,
+        protein_knn=5,
+        cross_knn=6,
+        source_knn=4,
+        radial_basis="gaussian_cosine",
+        radial_envelope="cosine",
+        use_layer_norm=True,
+        use_residual_ffn=True,
+        edge_gate=True,
+        use_pair_trunk=True,
+        pair_dim=24,
+        pair_num_blocks=2,
+        distogram_bins=12,
+        use_copy_mutate_gate=True,
+        copy_gate_classes=5,
+    )
+    model = ComplexDenoiserBackbone(config)
+
+    out = model(
+        protein_atom_type=torch.randint(0, config.num_protein_atom_types, (16,)),
+        protein_pos=torch.randn(16, 3),
+        protein_batch=torch.tensor([0] * 7 + [1] * 9),
+        ligand_atom_type=torch.randint(0, config.num_ligand_atom_types, (10,)),
+        ligand_pos=torch.randn(10, 3),
+        ligand_batch=torch.tensor([0] * 4 + [1] * 6),
+        time=torch.tensor([0.15, 0.65]),
+        source_atom_type=torch.randint(0, config.num_ligand_atom_types, (9,)),
+        source_pos=torch.randn(9, 3),
+        source_batch=torch.tensor([0] * 4 + [1] * 5),
+    )
+
+    n_pl_edges = out["protein_ligand_edge_index"].shape[1]
+    assert out["distogram_logits"].shape == (n_pl_edges, config.distogram_bins)
+    assert out["contact_logits"].shape == (n_pl_edges,)
+    assert out["copy_gate_logits"].shape == (10, config.copy_gate_classes)
+    assert torch.isfinite(out["distogram_logits"]).all()
+    assert torch.isfinite(out["contact_logits"]).all()
+    assert torch.isfinite(out["copy_gate_logits"]).all()
+
+    score_out = model(
+        protein_atom_type=torch.randint(0, config.num_protein_atom_types, (16,)),
+        protein_pos=torch.randn(16, 3),
+        protein_batch=torch.tensor([0] * 7 + [1] * 9),
+        ligand_atom_type=torch.randint(0, config.num_ligand_atom_types, (10,)),
+        ligand_pos=torch.randn(10, 3),
+        ligand_batch=torch.tensor([0] * 4 + [1] * 6),
+        time=torch.tensor([0.15, 0.65]),
+        source_atom_type=torch.randint(0, config.num_ligand_atom_types, (9,)),
+        source_pos=torch.randn(9, 3),
+        source_batch=torch.tensor([0] * 4 + [1] * 5),
+        score_only=True,
+    )
+    assert set(score_out) == {"complex_score"}
+    assert score_out["complex_score"].shape == (2,)
+
+
+def test_v3_auxiliary_losses_and_source_negative_ranking():
+    torch.manual_seed(29)
+    config = BackboneConfig(
+        hidden_dim=40,
+        time_dim=32,
+        rbf_dim=16,
+        num_blocks=1,
+        ligand_knn=4,
+        protein_knn=5,
+        cross_knn=6,
+        source_knn=4,
+        radial_basis="gaussian_cosine",
+        radial_envelope="cosine",
+        use_layer_norm=True,
+        use_residual_ffn=True,
+        edge_gate=True,
+        use_pair_trunk=True,
+        pair_dim=20,
+        pair_num_blocks=1,
+        distogram_bins=10,
+        use_copy_mutate_gate=True,
+        copy_gate_classes=5,
+    )
+    diffusion = ProteinConditionedDiffusion(
+        ComplexDenoiserBackbone(config),
+        DiffusionConfig(
+            num_timesteps=24,
+            atom_mask_token=config.num_ligand_atom_types - 1,
+            hard_negative_loss_weight=0.1,
+            hard_negative_score_only=True,
+            hard_negative_grad_side="positive",
+            distogram_loss_weight=0.1,
+            contact_loss_weight=0.1,
+            copy_gate_loss_weight=0.1,
+        ),
+    )
+    batch = {
+        "protein_atom_type": torch.randint(0, config.num_protein_atom_types, (18,)),
+        "protein_pos": torch.randn(18, 3),
+        "protein_batch": torch.tensor([0] * 8 + [1] * 10),
+        "ligand_atom_type": torch.randint(0, config.num_ligand_atom_types - 1, (9,)),
+        "ligand_pos": torch.randn(9, 3),
+        "ligand_batch": torch.tensor([0] * 4 + [1] * 5),
+        "ligand_bond_edge_index": torch.tensor([[0, 1, 4, 5], [1, 2, 5, 6]]),
+        "ligand_bond_type": torch.tensor([1, 1, 2, 1]),
+        "source_atom_type": torch.randint(0, config.num_ligand_atom_types - 1, (8,)),
+        "source_pos": torch.randn(8, 3),
+        "source_batch": torch.tensor([0] * 3 + [1] * 5),
+    }
+
+    out = diffusion.training_loss(batch)
+    assert torch.isfinite(out["loss"])
+    assert torch.isfinite(out["distogram_loss"])
+    assert torch.isfinite(out["contact_loss"])
+    assert torch.isfinite(out["copy_gate_loss"])
+    assert torch.isfinite(out["hard_negative_loss"])
+    assert torch.isfinite(out["score_gap"])
+    assert out["hard_negative_count"].item() == 2
+    out["loss"].backward()
+    assert any(p.grad is not None for p in diffusion.parameters())
+
+
+def test_partial_init_supports_added_v3_modules(tmp_path):
+    torch.manual_seed(23)
+    base_config = BackboneConfig(
+        hidden_dim=32,
+        time_dim=32,
+        rbf_dim=16,
+        num_blocks=1,
+        ligand_knn=4,
+        protein_knn=4,
+        cross_knn=4,
+        source_knn=4,
+    )
+    base = ProteinConditionedDiffusion(
+        ComplexDenoiserBackbone(base_config),
+        DiffusionConfig(num_timesteps=16, atom_mask_token=base_config.num_ligand_atom_types - 1),
+    )
+    ckpt = tmp_path / "base.pt"
+    torch.save({"model_state": base.state_dict()}, ckpt)
+
+    v3_config = BackboneConfig(
+        hidden_dim=32,
+        time_dim=32,
+        rbf_dim=16,
+        num_blocks=1,
+        ligand_knn=4,
+        protein_knn=4,
+        cross_knn=4,
+        source_knn=4,
+        radial_basis="gaussian_cosine",
+        radial_envelope="cosine",
+        use_layer_norm=True,
+        use_residual_ffn=True,
+        edge_gate=True,
+    )
+    v3_model = ProteinConditionedDiffusion(
+        ComplexDenoiserBackbone(v3_config),
+        DiffusionConfig(num_timesteps=16, atom_mask_token=v3_config.num_ligand_atom_types - 1),
+    )
+    message = load_model_weights(ckpt, v3_model, weights="model")
+
+    assert "model weights" in message
+    assert "loaded=" in message
 
 
 if __name__ == "__main__":

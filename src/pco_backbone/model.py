@@ -7,6 +7,7 @@ from torch import nn
 
 from .layers import (
     LigandUpdateBlock,
+    PairTrunkBlock,
     RadialBasis,
     ScalarMessageBlock,
     SinusoidalTimeEmbedding,
@@ -30,6 +31,23 @@ class BackboneConfig:
     source_knn: int = 16
     cutoff: float = 12.0
     dropout: float = 0.0
+    radial_basis: str = "gaussian"
+    radial_envelope: str = "none"
+    use_layer_norm: bool = False
+    use_residual_ffn: bool = False
+    ffn_multiplier: int = 2
+    edge_gate: bool = False
+    layer_scale_init: float = 1.0
+    use_pair_trunk: bool = False
+    pair_dim: int = 128
+    pair_num_blocks: int = 4
+    pair_ffn_multiplier: int = 2
+    distogram_bins: int = 32
+    distogram_min: float = 1.0
+    distogram_max: float = 12.0
+    contact_cutoff: float = 4.5
+    use_copy_mutate_gate: bool = False
+    copy_gate_classes: int = 5
 
 
 class ComplexDenoiserBackbone(nn.Module):
@@ -50,32 +68,110 @@ class ComplexDenoiserBackbone(nn.Module):
         self.protein_atom_embed = nn.Embedding(config.num_protein_atom_types, h)
         self.time_embed = SinusoidalTimeEmbedding(config.time_dim)
         self.time_to_hidden = make_mlp(config.time_dim, h, h, num_layers=2)
-        self.rbf = RadialBasis(config.rbf_dim, config.cutoff)
+        self.rbf = RadialBasis(
+            config.rbf_dim,
+            config.cutoff,
+            basis=config.radial_basis,
+            envelope=config.radial_envelope,
+        )
 
         self.protein_blocks = nn.ModuleList(
             [
-                ScalarMessageBlock(h, config.rbf_dim, config.time_dim, dropout=config.dropout)
+                ScalarMessageBlock(
+                    h,
+                    config.rbf_dim,
+                    config.time_dim,
+                    dropout=config.dropout,
+                    use_layer_norm=config.use_layer_norm,
+                    use_residual_ffn=config.use_residual_ffn,
+                    ffn_multiplier=config.ffn_multiplier,
+                    edge_gate=config.edge_gate,
+                    layer_scale_init=config.layer_scale_init,
+                )
                 for _ in range(config.num_blocks)
             ]
         )
         self.ligand_blocks = nn.ModuleList(
             [
-                LigandUpdateBlock(h, config.rbf_dim, config.time_dim, dropout=config.dropout)
+                LigandUpdateBlock(
+                    h,
+                    config.rbf_dim,
+                    config.time_dim,
+                    dropout=config.dropout,
+                    use_layer_norm=config.use_layer_norm,
+                    use_residual_ffn=config.use_residual_ffn,
+                    ffn_multiplier=config.ffn_multiplier,
+                    edge_gate=config.edge_gate,
+                    layer_scale_init=config.layer_scale_init,
+                )
                 for _ in range(config.num_blocks)
             ]
         )
         self.source_blocks = nn.ModuleList(
             [
-                ScalarMessageBlock(h, config.rbf_dim, config.time_dim, dropout=config.dropout)
+                ScalarMessageBlock(
+                    h,
+                    config.rbf_dim,
+                    config.time_dim,
+                    dropout=config.dropout,
+                    use_layer_norm=config.use_layer_norm,
+                    use_residual_ffn=config.use_residual_ffn,
+                    ffn_multiplier=config.ffn_multiplier,
+                    edge_gate=config.edge_gate,
+                    layer_scale_init=config.layer_scale_init,
+                )
                 for _ in range(config.num_blocks)
             ]
         )
         self.source_pool_proj = make_mlp(h, h, h, num_layers=2, dropout=config.dropout)
+        if config.use_pair_trunk:
+            pair_input_dim = h * 2 + config.rbf_dim + config.time_dim
+            self.pair_init = make_mlp(
+                pair_input_dim,
+                max(h, config.pair_dim),
+                config.pair_dim,
+                num_layers=2,
+                dropout=config.dropout,
+            )
+            self.pair_blocks = nn.ModuleList(
+                [
+                    PairTrunkBlock(
+                        h,
+                        config.pair_dim,
+                        config.rbf_dim,
+                        config.time_dim,
+                        dropout=config.dropout,
+                        use_layer_norm=True,
+                        edge_gate=config.edge_gate,
+                        ffn_multiplier=config.pair_ffn_multiplier,
+                        layer_scale_init=config.layer_scale_init,
+                    )
+                    for _ in range(config.pair_num_blocks)
+                ]
+            )
+            self.distogram_head = make_mlp(
+                config.pair_dim,
+                h,
+                config.distogram_bins,
+                num_layers=2,
+                dropout=config.dropout,
+            )
+            self.contact_head = make_mlp(config.pair_dim, h, 1, num_layers=2, dropout=config.dropout)
+            self.pair_bond_proj = make_mlp(config.pair_dim, h, config.pair_dim, num_layers=2, dropout=config.dropout)
+        if config.use_copy_mutate_gate:
+            self.copy_gate_head = make_mlp(
+                h,
+                h,
+                config.copy_gate_classes,
+                num_layers=3,
+                dropout=config.dropout,
+            )
 
         self.atom_head = make_mlp(h, h, config.num_ligand_atom_types, num_layers=3, dropout=config.dropout)
         self.pos_head = make_mlp(h, h, 3, num_layers=3, dropout=config.dropout)
+        bond_in_dim = h * 2 + config.rbf_dim + (config.pair_dim if config.use_pair_trunk else 0)
         self.bond_head = make_mlp(
-            h * 2 + config.rbf_dim,
+            bond_in_dim,
             h,
             config.num_bond_types,
             num_layers=3,
@@ -94,6 +190,19 @@ class ComplexDenoiserBackbone(nn.Module):
         src, dst = edge_index
         dist = torch.linalg.norm(dst_pos[dst] - src_pos[src], dim=-1)
         return self.rbf(dist)
+
+    def _init_pair_h(
+        self,
+        src_h: torch.Tensor,
+        dst_h: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_rbf: torch.Tensor,
+        time_per_dst: torch.Tensor,
+    ) -> torch.Tensor:
+        if edge_index.numel() == 0:
+            return dst_h.new_zeros((0, self.config.pair_dim))
+        src, dst = edge_index
+        return self.pair_init(torch.cat([src_h[src], dst_h[dst], edge_rbf, time_per_dst[dst]], dim=-1))
 
     @staticmethod
     def _graph_mean(h: torch.Tensor, batch: torch.Tensor, n_graphs: int) -> torch.Tensor:
@@ -128,6 +237,7 @@ class ComplexDenoiserBackbone(nn.Module):
         source_pos: torch.Tensor | None = None,
         source_batch: torch.Tensor | None = None,
         source_edge_index: torch.Tensor | None = None,
+        score_only: bool = False,
     ) -> dict[str, torch.Tensor]:
         if ligand_pos.shape[-1] != 3 or protein_pos.shape[-1] != 3:
             raise ValueError("positions must have shape [N, 3]")
@@ -257,19 +367,54 @@ class ComplexDenoiserBackbone(nn.Module):
                 source_pool = self._graph_mean(source_h, source_batch, n_graphs)
                 ligand_h = ligand_h + self.source_pool_proj(source_pool[ligand_batch])
 
+        ll_rbf = self._edge_rbf(ligand_pos, ligand_pos, ll_edge_index)
+        pl_rbf = self._edge_rbf(protein_pos, ligand_pos, pl_edge_index)
+        sl_rbf = self._edge_rbf(source_pos, ligand_pos, sl_edge_index) if has_source else None
+        ll_pair_h = None
+        pl_pair_h = None
+        sl_pair_h = None
+        if self.config.use_pair_trunk:
+            ll_pair_h = self._init_pair_h(ligand_h, ligand_h, ll_edge_index, ll_rbf, time_ligand)
+            pl_pair_h = self._init_pair_h(protein_h, ligand_h, pl_edge_index, pl_rbf, time_ligand)
+            sl_pair_h = (
+                self._init_pair_h(source_h, ligand_h, sl_edge_index, sl_rbf, time_ligand)
+                if has_source and sl_edge_index is not None and sl_rbf is not None
+                else None
+            )
+            for pair_block in self.pair_blocks:
+                ligand_h, ll_pair_h, pl_pair_h, sl_pair_h = pair_block(
+                    ligand_h=ligand_h,
+                    protein_h=protein_h,
+                    source_h=source_h if has_source else None,
+                    ll_edge_index=ll_edge_index,
+                    pl_edge_index=pl_edge_index,
+                    sl_edge_index=sl_edge_index if has_source else None,
+                    ll_rbf=ll_rbf,
+                    pl_rbf=pl_rbf,
+                    sl_rbf=sl_rbf,
+                    time_ligand=time_ligand,
+                    ll_pair_h=ll_pair_h,
+                    pl_pair_h=pl_pair_h,
+                    sl_pair_h=sl_pair_h,
+                )
+
         pos_update = self.pos_head(ligand_h)
         atom_logits = self.atom_head(ligand_h)
 
-        ll_rbf = self._edge_rbf(ligand_pos, ligand_pos, ll_edge_index)
         src, dst = ll_edge_index
-        bond_input = torch.cat([ligand_h[src], ligand_h[dst], ll_rbf], dim=-1)
+        bond_parts = [ligand_h[src], ligand_h[dst], ll_rbf]
+        if self.config.use_pair_trunk and ll_pair_h is not None:
+            bond_parts.append(self.pair_bond_proj(ll_pair_h))
+        bond_input = torch.cat(bond_parts, dim=-1)
         bond_logits = self.bond_head(bond_input)
 
         ligand_pool = self._graph_mean(ligand_h, ligand_batch, n_graphs)
         protein_pool = self._graph_mean(protein_h, protein_batch, n_graphs)
         complex_score = self.global_head(torch.cat([ligand_pool, protein_pool], dim=-1)).squeeze(-1)
+        if score_only:
+            return {"complex_score": complex_score}
 
-        return {
+        out = {
             "pos_update": pos_update,
             "atom_logits": atom_logits,
             "bond_edge_index": ll_edge_index,
@@ -279,3 +424,14 @@ class ComplexDenoiserBackbone(nn.Module):
             "protein_h": protein_h,
             **({"source_h": source_h} if has_source else {}),
         }
+        if self.config.use_pair_trunk and pl_pair_h is not None:
+            out.update(
+                {
+                    "protein_ligand_edge_index": pl_edge_index,
+                    "distogram_logits": self.distogram_head(pl_pair_h),
+                    "contact_logits": self.contact_head(pl_pair_h).squeeze(-1),
+                }
+            )
+        if self.config.use_copy_mutate_gate:
+            out["copy_gate_logits"] = self.copy_gate_head(ligand_h)
+        return out

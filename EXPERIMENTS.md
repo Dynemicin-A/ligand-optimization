@@ -1,42 +1,58 @@
-# Experiment Plan
+# v3 Experiment Plan
 
-## Immediate Local Checks
+## Current Goal
 
-1. Unit tests:
-   ```bash
-   python3 tests/test_backbone.py
-   python3 -m pytest tests
-   ```
+Make backbone v3 learn useful protein-conditioned H2L transformations, then
+validate by sampling and molecule-level evaluation. Validation loss alone is not
+enough; the model must produce chemically valid molecules that improve
+target/source-relevant metrics.
 
-2. Synthetic training:
-   ```bash
-   python3 scripts/train_diffusion.py --config configs/train_synthetic_tiny.yaml --outdir outputs/smoke --device cpu --max-steps 10
-   ```
+## Active Runs
 
-3. Synthetic sampling:
-   ```bash
-   python3 scripts/sample_diffusion.py --checkpoint outputs/smoke/checkpoint_last.pt --out outputs/smoke/sample.pt --sdf-out outputs/smoke/sample.sdf --device cpu --num-steps 16
-   ```
+Use only v3 configs and the unified wrapper:
 
-4. Chemical evaluation:
-   ```bash
-   python3 scripts/evaluate_molecules.py --generated-sdf outputs/smoke/sample.sdf --out outputs/smoke/eval.json
-   ```
+```bash
+python scripts/ligopt_v3.py train-pretrain -- --device cuda
+python scripts/ligopt_v3.py train-h2l -- --device cuda --init-model outputs/v3_pretrain/checkpoint_best.pt
+```
 
-## Main Paper Experiments
+## Stop Criteria
 
-| Group | Data | Method | Primary metrics |
-| --- | --- | --- | --- |
-| A0 | H2L | fixed scaffold baseline | Validity, HitRediscover, Vina, scaffold retention |
-| A1 | H2L | flexible scaffold baseline | Validity, HitRediscover, Vina, scaffold RMSD |
-| B0 | H2L | diffusion with source regularization | Validity, HitRediscover, source similarity |
-| B1 | H2L | diffusion with free scaffold migration | Validity, HitRediscover, Vina, scaffold hopping |
+Stop and review instead of extending weak runs when:
 
-## Later Ablations
+- best validation loss does not beat the current baseline after the configured
+  early window
+- three validation rounds fail to improve by the configured `min_delta`
+- atom-type loss rises while coordinate loss dominates training
+- hard-negative and ranking signals remain inactive
+- samples are invalid or collapse to source-like molecules
 
-- Replace diffusion objective with flow matching.
-- Replace source conditioning style: graph-level only vs source-to-ligand cross message.
-- Add affinity/property guidance.
-- Add variable ligand-size proposal.
-- Add robust RDKit/OpenBabel reconstruction.
-- Add PoseBusters/GenBench3D evaluation.
+## Review Contract
+
+Every completed, failed, early-stopped, or manually stopped run must produce:
+
+- `quality_review.json`
+- `quality_review.md`
+- `improvement_review.json`
+- `improvement_review.md`
+
+Command:
+
+```bash
+python scripts/ligopt_v3.py review -- \
+  --run-dir outputs/<run> \
+  --config outputs/<run>/config.yaml \
+  --log logs/<run>.log \
+  --baseline-name current_best \
+  --baseline-valid-loss 1.5313
+```
+
+## Next Design Levers
+
+Prefer architectural or objective changes over generic denoising sweeps:
+
+- strengthen pair trunk depth/edge update where validation supports it
+- make hard-negative sampling/counts effective
+- add or tune copy/mutate supervision
+- add contact/clash/ranking auxiliary losses
+- inspect generated molecules before judging a checkpoint as useful

@@ -65,6 +65,7 @@ def test_csv_preprocess_complex_dataset(tmp_path):
     record = torch.load(paths[0], map_location="cpu", weights_only=False)
     assert record["record_id"] == "toy"
     assert "negative_ligand_atom_type" in record
+    assert "source_edge_index" in record
     assert record["protein_atom_type"].numel() > 0
 
 
@@ -74,6 +75,7 @@ def test_directory_preprocess_multiple_ligands(tmp_path):
     write_pdb(complex_dir / "target_pocket.pdb")
     write_sdf(complex_dir / "ligand_a.sdf", "CCO")
     write_sdf(complex_dir / "ligand_b.sdf", "CCN")
+    write_sdf(complex_dir / "target_prot.sdf", "CCCC")
 
     outdir = tmp_path / "out_dir"
     run_preprocess(

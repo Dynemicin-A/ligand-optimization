@@ -46,7 +46,7 @@ echo "checkpoint: $CHECKPOINT"
 echo "sample_dir: $SAMPLE_DIR"
 echo "eval_out: $EVAL_OUT"
 
-python scripts/sample_h2l_manifest.py \
+python scripts/ligopt_v3.py sample-h2l -- \
   --checkpoint "$CHECKPOINT" \
   --manifest "$MANIFEST" \
   --outdir "$SAMPLE_DIR" \

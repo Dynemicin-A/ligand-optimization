@@ -1,0 +1,99 @@
+seed: 2026
+
+model:
+  num_ligand_atom_types: 16
+  num_protein_atom_types: 32
+  num_bond_types: 5
+  hidden_dim: 192
+  time_dim: 64
+  rbf_dim: 32
+  num_blocks: 6
+  ligand_knn: 20
+  protein_knn: 36
+  cross_knn: 96
+  source_knn: 20
+  cutoff: 12.0
+  dropout: 0.3
+  radial_basis: gaussian_cosine
+  radial_envelope: cosine
+  use_layer_norm: true
+  use_residual_ffn: true
+  ffn_multiplier: 2
+  edge_gate: true
+  layer_scale_init: 0.1
+  use_pair_trunk: true
+  pair_dim: 96
+  pair_num_blocks: 3
+  pair_ffn_multiplier: 2
+  distogram_bins: 32
+  distogram_min: 1.0
+  distogram_max: 12.0
+  contact_cutoff: 4.5
+  use_copy_mutate_gate: true
+  copy_gate_classes: 5
+
+diffusion:
+  num_timesteps: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+  atom_mask_token: 15
+  pos_loss_weight: 1.0
+  atom_loss_weight: 1.0
+  bond_loss_weight: 0.2
+  hard_negative_loss_weight: 0.2
+  hard_negative_margin: 0.2
+  hard_negative_score_only: true
+  hard_negative_grad_side: positive
+  distogram_loss_weight: 0.2
+  contact_loss_weight: 0.1
+  copy_gate_loss_weight: 0.2
+  copy_gate_copy_threshold: 1.25
+  copy_gate_move_threshold: 3.0
+
+data:
+  kind: pt_manifest
+  manifest: data/processed_chembl_h2l_round6_delta05/train/manifest.txt
+  heldout_manifest: data/processed_chembl_h2l_round6_delta05/val/manifest.txt
+
+train:
+  batch_size: 6
+  num_workers: 4
+  pin_memory: true
+  drop_last: true
+  valid_fraction: 0.03
+  max_steps: 120000
+  lr: 0.00001
+  weight_decay: 0.001
+  grad_clip: 1.0
+  log_every: 50
+  valid_every: 2000
+  valid_batches: 64
+  save_every: 2000
+  ema:
+    enabled: true
+    decay: 0.999
+    validate: true
+  early_stopping:
+    enabled: true
+    monitor: valid_loss
+    mode: min
+    min_delta: 0.005
+    patience: 4
+    start_after: 10000
+    save_best: true
+  weak_learning_stop:
+    enabled: true
+    monitor: valid_loss
+    mode: min
+    baseline_valid_loss: 1.5313
+    max_relative_gap: 0.03
+    core_monitor: valid_pos_loss
+    core_mode: min
+    core_min_delta: 0.005
+    core_max: 0.985
+    patience: 3
+    min_validations: 5
+    start_after: 10000
+    inactive_metrics:
+      - valid_hard_negative_loss
+      - valid_copy_gate_loss

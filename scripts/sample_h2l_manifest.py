@@ -15,7 +15,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from pco_backbone import BackboneConfig, ComplexDenoiserBackbone, DiffusionConfig, ProteinConditionedDiffusion  # noqa: E402
 from pco_backbone.chem import tensors_to_mol, write_mol_sdf  # noqa: E402
-from pco_backbone.data import _coerce_record, collate_complex_records, move_batch_to_device  # noqa: E402
+from pco_backbone.data import collate_complex_records, move_batch_to_device  # noqa: E402
+from pco_backbone.records import coerce_model_record  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -119,7 +120,7 @@ def main() -> None:
 
     for i, record_path in enumerate(tqdm(selected, desc="sample-h2l")):
         raw = torch.load(record_path, map_location="cpu", weights_only=False)
-        rec = _coerce_record(raw)
+        rec = coerce_model_record(raw)
         rec["ligand_atom_type"] = torch.full_like(rec["ligand_atom_type"], model.atom_mask_token)
         batch = collate_complex_records([rec])
         batch = move_batch_to_device(batch, device)

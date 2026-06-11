@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from pco_backbone.chem import crop_protein_to_ligand, load_first_mol, mol_to_record_tensors, parse_pdb_atoms  # noqa: E402
+from pco_backbone.records import build_model_record  # noqa: E402
 
 
 PROTEIN_SUFFIXES = {".pdb", ".pdbqt", ".ent", ".pdb.gz", ".pdbqt.gz"}
@@ -27,6 +28,8 @@ ALL_LIGAND_SUFFIXES = LIGAND_SUFFIXES | TEXT_LIGAND_SUFFIXES
 
 PROTEIN_NAME_HINTS = ("pocket", "protein", "receptor", "rec", "prep")
 LIGAND_NAME_HINTS = ("ligand", "lig", "pose", "crystal", "docked")
+PROTEIN_NAME_RE = re.compile(r"(^|[^a-z0-9])(protein|prot|pocket|receptor|rec|prep)([^a-z0-9]|$)")
+LIGAND_NAME_RE = re.compile(r"(^|[^a-z0-9])(ligand|lig|pose|crystal|docked|mol)([^a-z0-9]|$)")
 
 COLUMN_ALIASES = {
     "record_id": ("record_id", "id", "complex_id", "pdb_id", "pdbid", "name"),
@@ -84,12 +87,36 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sanitize", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--limit-dirs", type=int, default=None, help="Directory discovery cap for quick smoke tests.")
+    parser.add_argument(
+        "--allow-protein-like-ligands",
+        action="store_true",
+        help="Keep protein/receptor/pocket-named files as ligand candidates during directory discovery.",
+    )
     return parser.parse_args()
 
 
 def has_suffix(path: Path, suffixes: set[str]) -> bool:
     name = path.name.lower()
     return any(name.endswith(suffix) for suffix in suffixes)
+
+
+def has_name_pattern(path: Path, pattern: re.Pattern[str]) -> bool:
+    name = path.name.lower()
+    for suffix in sorted(PROTEIN_SUFFIXES | ALL_LIGAND_SUFFIXES, key=len, reverse=True):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return bool(pattern.search(name))
+
+
+def is_ligand_candidate(path: Path, *, allow_protein_like: bool = False) -> bool:
+    if not has_suffix(path, ALL_LIGAND_SUFFIXES):
+        return False
+    if allow_protein_like:
+        return True
+    protein_like = has_name_pattern(path, PROTEIN_NAME_RE)
+    ligand_like = has_name_pattern(path, LIGAND_NAME_RE)
+    return not (protein_like and not ligand_like)
 
 
 def normalize_id(raw: str) -> str:
@@ -210,7 +237,7 @@ def iter_candidate_dirs(root: Path, limit_dirs: int | None) -> Iterable[Path]:
         except OSError:
             continue
         has_protein = any(item.is_file() and has_suffix(item, PROTEIN_SUFFIXES) for item in files)
-        has_ligand = any(item.is_file() and has_suffix(item, ALL_LIGAND_SUFFIXES) for item in files)
+        has_ligand = any(item.is_file() and is_ligand_candidate(item) for item in files)
         if has_protein and has_ligand:
             yield path
             yielded += 1
@@ -225,12 +252,17 @@ def rows_from_directory(
     limit_dirs: int | None,
     ligands_per_protein: str,
     max_ligands_per_dir: int | None,
+    allow_protein_like_ligands: bool,
 ) -> list[InputRow]:
     rows: list[InputRow] = []
     for directory in iter_candidate_dirs(root, limit_dirs):
         files = [item for item in directory.iterdir() if item.is_file()]
         proteins = [item for item in files if has_suffix(item, PROTEIN_SUFFIXES)]
-        ligands = [item for item in files if has_suffix(item, ALL_LIGAND_SUFFIXES)]
+        ligands = [
+            item
+            for item in files
+            if is_ligand_candidate(item, allow_protein_like=allow_protein_like_ligands)
+        ]
         if not proteins or not ligands:
             continue
         protein_path = sorted(proteins, key=lambda path: score_protein(path, preset), reverse=True)[0]
@@ -296,34 +328,27 @@ def build_record(row: InputRow, outdir: Path, pocket_radius: float, sanitize: bo
     source = mol_to_record_tensors(source_mol)
     target = mol_to_record_tensors(target_mol)
     protein = crop_protein_to_ligand(protein_full, source["pos"], pocket_radius)
-    record = {
+    metadata = {
         "record_id": row.record_id,
         "target_id": row.target_id,
         "series_id": row.series_id,
-        "protein_atom_type": protein["atom_type"],
-        "protein_pos": protein["pos"],
-        "source_atom_type": source["atom_type"],
-        "source_pos": source["pos"],
-        "ligand_atom_type": target["atom_type"],
-        "ligand_pos": target["pos"],
-        "ligand_bond_edge_index": target["bond_edge_index"],
-        "ligand_bond_type": target["bond_type"],
         "protein_path": str(row.protein_path.resolve()),
         "source_ligand_path": str(row.source_ligand_path.resolve()),
         "target_ligand_path": str(row.target_ligand_path.resolve()),
     }
+    negative = None
     if row.negative_ligand_path is not None:
         negative_mol = load_first_mol(row.negative_ligand_path, sanitize=sanitize)
         negative = mol_to_record_tensors(negative_mol)
-        record.update(
-            {
-                "negative_ligand_atom_type": negative["atom_type"],
-                "negative_ligand_pos": negative["pos"],
-                "negative_ligand_bond_edge_index": negative["bond_edge_index"],
-                "negative_ligand_bond_type": negative["bond_type"],
-                "negative_ligand_path": str(row.negative_ligand_path.resolve()),
-            }
-        )
+        metadata["negative_ligand_path"] = str(row.negative_ligand_path.resolve())
+    record = build_model_record(
+        protein=protein,
+        source=source,
+        ligand=target,
+        negative=negative,
+        metadata=metadata,
+        source_mode="self",
+    )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(record, out_path)
     return (
@@ -377,6 +402,7 @@ def main() -> None:
             args.limit_dirs,
             args.ligands_per_protein,
             args.max_ligands_per_dir,
+            args.allow_protein_like_ligands,
         )
     rows = deduplicate_record_ids(rows)
     if args.max_records is not None:

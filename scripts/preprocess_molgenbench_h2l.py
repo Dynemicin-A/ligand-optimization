@@ -24,6 +24,7 @@ from pco_backbone.chem import (  # noqa: E402
     mol_to_record_tensors,
     parse_pdb_atoms,
 )
+from pco_backbone.records import build_model_record  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -395,22 +396,15 @@ def main() -> None:
                     record_id = base_record_id if args.augment_copies == 1 else f"{base_record_id}_aug{aug_idx:02d}"
                     out_path = args.outdir / item.target_id / f"{record_id}.pt"
                     out_path.parent.mkdir(parents=True, exist_ok=True)
-                    record = {
+                    metadata = {
                         "record_id": record_id,
+                        "dataset_name": "molgenbench_v3_h2l",
                         "target_id": item.target_id,
                         "series_id": item.series_id,
                         "pair_index": pair_index,
                         "source_index": pair.source_index,
                         "target_index": pair.target_index,
                         "augmentation_index": aug_idx,
-                        "protein_atom_type": protein["atom_type"],
-                        "protein_pos": protein["pos"],
-                        "source_atom_type": source["atom_type"],
-                        "source_pos": source["pos"],
-                        "ligand_atom_type": target["atom_type"],
-                        "ligand_pos": target["pos"],
-                        "ligand_bond_edge_index": target["bond_edge_index"],
-                        "ligand_bond_type": target["bond_type"],
                         "protein_path": str(item.protein_path.resolve()),
                         "source_ligand_path": str(pair.source_path.resolve()),
                         "target_ligand_path": str(item.target_ligand_path.resolve()),
@@ -422,14 +416,10 @@ def main() -> None:
                         "target_affinity_unit": prop(pair.target_mol, "Affinity Unit"),
                     }
                     if negative is not None:
-                        record.update(
+                        metadata.update(
                             {
                                 "negative_label": pair.negative_label,
                                 "negative_index": pair.negative_index,
-                                "negative_ligand_atom_type": negative["atom_type"],
-                                "negative_ligand_pos": negative["pos"],
-                                "negative_ligand_bond_edge_index": negative["bond_edge_index"],
-                                "negative_ligand_bond_type": negative["bond_type"],
                                 "negative_ligand_path": str(pair.negative_path.resolve()) if pair.negative_path else "",
                                 "negative_affinity": prop(pair.negative_mol, "Affinity") if pair.negative_mol else "",
                                 "negative_affinity_type": prop(pair.negative_mol, "Affinity Type") if pair.negative_mol else "",
@@ -437,6 +427,13 @@ def main() -> None:
                                 "negative_similarity_to_target": pair.negative_similarity,
                             }
                         )
+                    record = build_model_record(
+                        protein=protein,
+                        source=source,
+                        ligand=target,
+                        negative=negative,
+                        metadata=metadata,
+                    )
                     record = augment_record(record, args, aug_idx, len(manifest_paths))
                     torch.save(record, out_path)
                     manifest_paths.append(out_path.resolve())

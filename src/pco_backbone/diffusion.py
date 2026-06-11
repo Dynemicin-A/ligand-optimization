@@ -20,6 +20,13 @@ class DiffusionConfig:
     bond_loss_weight: float = 0.2
     hard_negative_loss_weight: float = 0.0
     hard_negative_margin: float = 0.2
+    hard_negative_score_only: bool = True
+    hard_negative_grad_side: str = "positive"
+    distogram_loss_weight: float = 0.0
+    contact_loss_weight: float = 0.0
+    copy_gate_loss_weight: float = 0.0
+    copy_gate_copy_threshold: float = 1.25
+    copy_gate_move_threshold: float = 3.0
 
 
 class ProteinConditionedDiffusion(nn.Module):
@@ -111,42 +118,215 @@ class ProteinConditionedDiffusion(nn.Module):
         ligand_batch: torch.Tensor,
         n_graphs: int,
         optional_source: dict[str, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         zero = ligand_pos.new_zeros(())
+        if self.config.hard_negative_loss_weight <= 0:
+            return zero, zero, zero, zero, zero
+
         if (
-            self.config.hard_negative_loss_weight <= 0
-            or "negative_ligand_atom_type" not in batch
-            or batch["negative_ligand_atom_type"].numel() == 0
+            "negative_ligand_atom_type" in batch
+            and "negative_ligand_pos" in batch
+            and "negative_ligand_batch" in batch
+            and batch["negative_ligand_atom_type"].numel() > 0
         ):
-            return zero, zero, zero
+            negative_atom_type = batch["negative_ligand_atom_type"]
+            negative_pos = batch["negative_ligand_pos"]
+            negative_batch = batch["negative_ligand_batch"]
+            negative_edge_index = batch.get("negative_ligand_bond_edge_index")
+        elif (
+            "source_atom_type" in optional_source
+            and "source_pos" in optional_source
+            and "source_batch" in optional_source
+            and optional_source["source_atom_type"].numel() > 0
+        ):
+            negative_atom_type = optional_source["source_atom_type"]
+            negative_pos = optional_source["source_pos"]
+            negative_batch = optional_source["source_batch"]
+            negative_edge_index = optional_source.get("source_edge_index")
+        else:
+            return zero, zero, zero, zero, zero
+
+        grad_side = self.config.hard_negative_grad_side
+        if grad_side not in {"both", "positive", "negative"}:
+            raise ValueError("hard_negative_grad_side must be one of: both, positive, negative")
 
         time_zero = ligand_pos.new_zeros(n_graphs)
-        pos_out = self.backbone(
-            protein_atom_type=protein_atom_type,
-            protein_pos=protein_pos,
-            protein_batch=protein_batch,
+
+        def score_forward(
+            atom_type: torch.Tensor,
+            pos: torch.Tensor,
+            graph_batch: torch.Tensor,
+            edge_index: torch.Tensor | None,
+        ) -> torch.Tensor:
+            out = self.backbone(
+                protein_atom_type=protein_atom_type,
+                protein_pos=protein_pos,
+                protein_batch=protein_batch,
+                ligand_atom_type=atom_type,
+                ligand_pos=pos,
+                ligand_batch=graph_batch,
+                time=time_zero,
+                ligand_edge_index=edge_index,
+                score_only=self.config.hard_negative_score_only,
+                **optional_source,
+            )
+            return out["complex_score"]
+
+        if grad_side == "negative":
+            with torch.no_grad():
+                pos_score_all = score_forward(
+                    ligand_atom_type,
+                    ligand_pos,
+                    ligand_batch,
+                    batch.get("ligand_edge_index"),
+                )
+            neg_score_all = score_forward(
+                negative_atom_type,
+                negative_pos,
+                negative_batch,
+                negative_edge_index,
+            )
+        else:
+            pos_score_all = score_forward(
+                ligand_atom_type,
+                ligand_pos,
+                ligand_batch,
+                batch.get("ligand_edge_index"),
+            )
+            if grad_side == "positive":
+                with torch.no_grad():
+                    neg_score_all = score_forward(
+                        negative_atom_type,
+                        negative_pos,
+                        negative_batch,
+                        negative_edge_index,
+                    )
+            else:
+                neg_score_all = score_forward(
+                    negative_atom_type,
+                    negative_pos,
+                    negative_batch,
+                    negative_edge_index,
+                )
+
+        neg_graphs = torch.unique(negative_batch)
+        pos_score = pos_score_all[neg_graphs]
+        neg_score = neg_score_all[neg_graphs]
+        ranking = F.relu(self.config.hard_negative_margin - pos_score + neg_score).mean()
+        score_gap = (pos_score - neg_score).mean()
+        hard_negative_count = ligand_pos.new_tensor(float(neg_graphs.numel()))
+        return ranking, pos_score.mean(), neg_score.mean(), score_gap, hard_negative_count
+
+    def _distogram_loss(
+        self,
+        out: dict[str, torch.Tensor],
+        protein_pos: torch.Tensor,
+        ligand_pos: torch.Tensor,
+    ) -> torch.Tensor:
+        logits = out.get("distogram_logits")
+        edge_index = out.get("protein_ligand_edge_index")
+        if self.config.distogram_loss_weight <= 0 or logits is None or edge_index is None or edge_index.numel() == 0:
+            return ligand_pos.new_zeros(())
+
+        src, dst = edge_index
+        dist = torch.linalg.norm(ligand_pos[dst] - protein_pos[src], dim=-1)
+        num_bins = logits.shape[-1]
+        boundaries = torch.linspace(
+            self.backbone.config.distogram_min,
+            self.backbone.config.distogram_max,
+            max(num_bins - 1, 1),
+            device=dist.device,
+            dtype=dist.dtype,
+        )
+        target = torch.bucketize(dist, boundaries).clamp(max=num_bins - 1).long()
+        return F.cross_entropy(logits, target)
+
+    def _contact_loss(
+        self,
+        out: dict[str, torch.Tensor],
+        protein_pos: torch.Tensor,
+        ligand_pos: torch.Tensor,
+    ) -> torch.Tensor:
+        logits = out.get("contact_logits")
+        edge_index = out.get("protein_ligand_edge_index")
+        if self.config.contact_loss_weight <= 0 or logits is None or edge_index is None or edge_index.numel() == 0:
+            return ligand_pos.new_zeros(())
+
+        src, dst = edge_index
+        dist = torch.linalg.norm(ligand_pos[dst] - protein_pos[src], dim=-1)
+        target = (dist <= self.backbone.config.contact_cutoff).to(logits.dtype)
+        return F.binary_cross_entropy_with_logits(logits, target)
+
+    def _copy_gate_targets(
+        self,
+        ligand_atom_type: torch.Tensor,
+        ligand_pos: torch.Tensor,
+        ligand_batch: torch.Tensor,
+        source_atom_type: torch.Tensor,
+        source_pos: torch.Tensor,
+        source_batch: torch.Tensor,
+        num_classes: int,
+    ) -> torch.Tensor:
+        copy_class = 0
+        mutate_class = min(1, num_classes - 1)
+        move_class = min(2, num_classes - 1)
+        grow_class = min(3, num_classes - 1)
+        targets = torch.full(
+            (ligand_atom_type.shape[0],),
+            grow_class,
+            dtype=torch.long,
+            device=ligand_atom_type.device,
+        )
+        if source_atom_type.numel() == 0 or ligand_atom_type.numel() == 0:
+            return targets
+
+        for graph_id in torch.unique(ligand_batch).tolist():
+            ligand_idx = torch.nonzero(ligand_batch == graph_id, as_tuple=False).flatten()
+            source_idx = torch.nonzero(source_batch == graph_id, as_tuple=False).flatten()
+            if ligand_idx.numel() == 0 or source_idx.numel() == 0:
+                continue
+            dist = torch.cdist(ligand_pos[ligand_idx], source_pos[source_idx])
+            nearest_dist, nearest_local = dist.min(dim=1)
+            nearest_source = source_idx[nearest_local]
+            same_type = ligand_atom_type[ligand_idx] == source_atom_type[nearest_source]
+            near_copy = nearest_dist <= self.config.copy_gate_copy_threshold
+            near_move = (
+                (nearest_dist > self.config.copy_gate_copy_threshold)
+                & (nearest_dist <= self.config.copy_gate_move_threshold)
+            )
+            targets[ligand_idx[near_copy & same_type]] = copy_class
+            targets[ligand_idx[near_copy & ~same_type]] = mutate_class
+            targets[ligand_idx[near_move]] = move_class
+        return targets
+
+    def _copy_gate_loss(
+        self,
+        out: dict[str, torch.Tensor],
+        ligand_atom_type: torch.Tensor,
+        ligand_pos: torch.Tensor,
+        ligand_batch: torch.Tensor,
+        optional_source: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        logits = out.get("copy_gate_logits")
+        if (
+            self.config.copy_gate_loss_weight <= 0
+            or logits is None
+            or "source_atom_type" not in optional_source
+            or "source_pos" not in optional_source
+            or "source_batch" not in optional_source
+        ):
+            return ligand_pos.new_zeros(())
+
+        targets = self._copy_gate_targets(
             ligand_atom_type=ligand_atom_type,
             ligand_pos=ligand_pos,
             ligand_batch=ligand_batch,
-            time=time_zero,
-            ligand_edge_index=batch.get("ligand_edge_index"),
-            **optional_source,
+            source_atom_type=optional_source["source_atom_type"],
+            source_pos=optional_source["source_pos"],
+            source_batch=optional_source["source_batch"],
+            num_classes=logits.shape[-1],
         )
-        neg_out = self.backbone(
-            protein_atom_type=protein_atom_type,
-            protein_pos=protein_pos,
-            protein_batch=protein_batch,
-            ligand_atom_type=batch["negative_ligand_atom_type"],
-            ligand_pos=batch["negative_ligand_pos"],
-            ligand_batch=batch["negative_ligand_batch"],
-            time=time_zero,
-            **optional_source,
-        )
-        neg_graphs = torch.unique(batch["negative_ligand_batch"])
-        pos_score = pos_out["complex_score"][neg_graphs]
-        neg_score = neg_out["complex_score"][neg_graphs]
-        ranking = F.relu(self.config.hard_negative_margin - pos_score + neg_score).mean()
-        return ranking, pos_score.mean(), neg_score.mean()
+        return F.cross_entropy(logits, targets)
 
     def training_loss(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         protein_atom_type = batch["protein_atom_type"]
@@ -196,7 +376,17 @@ class ProteinConditionedDiffusion(nn.Module):
         else:
             bond_loss = F.cross_entropy(out["bond_logits"], bond_target)
 
-        hard_negative_loss, pos_score_mean, neg_score_mean = self._hard_negative_loss(
+        distogram_loss = self._distogram_loss(out, protein_pos, ligand_pos)
+        contact_loss = self._contact_loss(out, protein_pos, ligand_pos)
+        copy_gate_loss = self._copy_gate_loss(out, ligand_atom_type, ligand_pos, ligand_batch, optional_source)
+
+        (
+            hard_negative_loss,
+            pos_score_mean,
+            neg_score_mean,
+            score_gap,
+            hard_negative_count,
+        ) = self._hard_negative_loss(
             batch=batch,
             protein_atom_type=protein_atom_type,
             protein_pos=protein_pos,
@@ -213,6 +403,9 @@ class ProteinConditionedDiffusion(nn.Module):
             + self.config.atom_loss_weight * atom_loss
             + self.config.bond_loss_weight * bond_loss
             + self.config.hard_negative_loss_weight * hard_negative_loss
+            + self.config.distogram_loss_weight * distogram_loss
+            + self.config.contact_loss_weight * contact_loss
+            + self.config.copy_gate_loss_weight * copy_gate_loss
         )
         return {
             "loss": total_loss,
@@ -220,8 +413,13 @@ class ProteinConditionedDiffusion(nn.Module):
             "atom_loss": atom_loss.detach(),
             "bond_loss": bond_loss.detach(),
             "hard_negative_loss": hard_negative_loss.detach(),
+            "distogram_loss": distogram_loss.detach(),
+            "contact_loss": contact_loss.detach(),
+            "copy_gate_loss": copy_gate_loss.detach(),
             "positive_score": pos_score_mean.detach(),
             "negative_score": neg_score_mean.detach(),
+            "score_gap": score_gap.detach(),
+            "hard_negative_count": hard_negative_count.detach(),
             "time_index": graph_t.detach(),
         }
 
